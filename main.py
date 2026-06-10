@@ -4,6 +4,15 @@
 # A FastAPI application for managing recruitment candidates and document requests
 # with JotForm webhook integration for form submissions.
 
+import base64
+from urllib import response
+import msal
+import os
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import re
 import ast
 import json
@@ -24,6 +33,66 @@ from pydantic import BaseModel
 
 app = FastAPI(title="HelpAtHandSupport API")
 DB_PATH = "hahs.db"
+STORAGE_ROOT = os.path.join(os.getcwd(), "uploaded_submissions")
+DRIVE_ID = os.getenv("DRIVE_ID", "").strip()
+
+# ───────────────────────────────────────────────────────────────────────────────
+# AUTHENTICATION SETUP (MICROSOFT GRAPH API)
+# ───────────────────────────────────────────────────────────────────────────────
+
+CLIENT_ID = os.getenv("CLIENT_ID")
+TENANT_ID = os.getenv("TENANT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+SITE_ID = os.getenv("SITE_ID")
+DRIVE_ID = os.getenv("DRIVE_ID")
+BASE_FOLDER = os.getenv("BASE_FOLDER", "HR Demo Candidate Log")
+STORAGE_ROOT = os.getenv("STORAGE_ROOT", "./local_storage")
+
+msal_app = msal.ConfidentialClientApplication(
+    client_id=CLIENT_ID,
+    client_credential=CLIENT_SECRET,
+    authority=f"https://login.microsoftonline.com/{TENANT_ID}"
+)
+
+
+def get_graph_access_token() -> str:
+    result = msal_app.acquire_token_for_client(
+        scopes=["https://graph.microsoft.com/.default"]
+    )
+    if "access_token" in result:
+        return result["access_token"]
+    raise HTTPException(500, f"Microsoft Graph authentication failed: {result.get('error_description')}")
+
+def get_graph_headers() -> dict:
+    return {"Authorization": f"Bearer {get_graph_access_token()}"}
+
+# Test Drive ID directly
+response1 = requests.get(
+    f"https://graph.microsoft.com/v1.0/drives/{os.getenv('DRIVE_ID')}/root",
+    headers={"Authorization": f"Bearer {get_graph_access_token()}"}
+)
+print("Drive test:", response1.status_code, response1.json())
+
+# Test new Site ID
+response2 = requests.get(
+    f"https://graph.microsoft.com/v1.0/sites/{os.getenv('SITE_ID')}/drive",
+    headers={"Authorization": f"Bearer {get_graph_access_token()}"}
+)
+print("Site test:", response2.status_code, response2.json())
+
+response3 = requests.get(
+    f"https://graph.microsoft.com/v1.0/drive/{os.getenv('DRIVE_ID')}/root",
+    headers={"Authorization": f"Bearer {get_graph_access_token()}"}
+)
+print(response3.status_code)
+print(response3.json())
+
+# Test authentication on startup
+try:
+    get_graph_access_token()
+    print("Authentication successful")
+except Exception as e:
+    print(f"Authentication failed: {e}")
 
 # ───────────────────────────────────────────────────────────────────────────────
 # DATABASE MANAGEMENT
@@ -493,6 +562,30 @@ def parse_raw_request(data: dict) -> dict:
     return raw
 
 
+def sanitize_filename(name: str) -> str:
+    """Create a filesystem-safe name from a user-provided value."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._-")
+    return cleaned or "submission"
+
+
+def download_bytes_from_url(url: str) -> bytes:
+    """Download a file from a JotForm URL or a base64 data URL."""
+    if not url:
+        raise ValueError("No URL supplied")
+
+    if url.startswith("data:"):
+        header, encoded = url.split(",", 1)
+        mime_type = header.split(";")[0].replace("data:", "")
+        padding = (-len(encoded)) % 4
+        if padding:
+            encoded += "=" * padding
+        return base64.b64decode(encoded, validate=False)
+
+    response = requests.get(url, timeout=60, stream=True)
+    response.raise_for_status()
+    return response.content
+
+
 def parse_jotform_image_url(raw_value):
     """
     Extract image URLs from various JotForm data structures.
@@ -525,8 +618,6 @@ def parse_jotform_image_url(raw_value):
             return parse_jotform_image_url(parsed)
         match = re.search(r'https?://[^\s\'"\[\]]+', text)
         return match.group(0) if match else None
-
-    return match.group(0) if match else None
 
     return None
 
@@ -724,6 +815,21 @@ def handle_document_request(raw: dict):
         if not existing_candidate and full_name:
             existing_candidate = conn.execute("SELECT id FROM candidates WHERE name = ?", (full_name,)).fetchone()
     
+    document_urls = {
+        "ndis_worker_check": ndis_worker_check,
+        "police_check": police_check,
+        "working_with_children": working_with_children,
+        "id_100_points": id_100_points,
+        "first_aid_cpr": first_aid_cpr,
+        "ndis_orientation": ndis_orientation,
+        "covid_training": covid_training,
+        "car_insurance": car_insurance,
+        "car_rego_proof": car_rego_proof,
+        "face_id_picture": face_id_picture,
+        "certificates_study": certificates_study,
+        "signature": signature,
+    }
+
     # If candidate exists, update them; otherwise create new
     if existing_candidate:
         cid = existing_candidate['id']
@@ -759,10 +865,25 @@ def handle_document_request(raw: dict):
             print(f"[WEBHOOK DEBUG] candidate UUID: {updated.get('id')}")
         except Exception:
             pass
+
+        try:
+            folder_ref = create_submission_folder(full_name, email)
+            save_submission_files(folder_ref, full_name, {
+                "full_name": full_name,
+                "email": email,
+                "mobile_number": mobile_number,
+                "state": state,
+                "car_registration": car_registration,
+                "submission_date": submission_date,
+            }, document_urls)
+            print("[STORAGE DEBUG] Submission files saved to folder", folder_ref)
+        except Exception as exc:
+            print(f"[STORAGE DEBUG] Submission storage failed: {exc}")
+
         return updated
     else:
         print(f"[WEBHOOK DEBUG] creating new candidate for {full_name}")
-        return create_candidate(CandidateIn(
+        created = create_candidate(CandidateIn(
             name=full_name,
             role="Support Worker",
             skills="N/A",
@@ -789,6 +910,171 @@ def handle_document_request(raw: dict):
             reference_2=reference_2 or None,
         ))
 
+        try:
+            folder_ref = create_submission_folder(full_name, email)
+            save_submission_files(folder_ref, full_name, {
+                "full_name": full_name,
+                "email": email,
+                "mobile_number": mobile_number,
+                "state": state,
+                "car_registration": car_registration,
+                "submission_date": submission_date,
+            }, document_urls)
+            print("[STORAGE DEBUG] Submission files saved to folder", folder_ref)
+        except Exception as exc:
+            print(f"[STORAGE DEBUG] Submission storage failed: {exc}")
 
+        return created
 
-  
+# ───────────────────────────────────────────────────────────────────────────────
+# ONE DRIVE INTEGRATION
+# ───────────────────────────────────────────────────────────────────────────────
+
+def get_onedrive_drive_target() -> dict:
+    """Return the best Graph endpoint information for OneDrive storage."""
+    if DRIVE_ID:
+        return {"type": "drive", "id": DRIVE_ID, "base_url": f"https://graph.microsoft.com/v1.0/drives/{DRIVE_ID}"}
+    if SITE_ID:
+        return {"type": "site", "id": SITE_ID, "base_url": f"https://graph.microsoft.com/v1.0/sites/{SITE_ID}/drive"}
+    return {}
+
+def create_submission_folder(full_name: str, email: str):
+    safe_name = sanitize_filename(full_name or "submission")
+    safe_email = sanitize_filename(email or "unknown")
+    folder_name = f"{safe_name}_{safe_email}"
+    
+    local_folder = os.path.join(STORAGE_ROOT, folder_name)
+    os.makedirs(local_folder, exist_ok=True)
+
+    if DRIVE_ID:
+        try:
+            token = get_graph_access_token()
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            response = requests.post(
+                f"https://graph.microsoft.com/v1.0/drives/{DRIVE_ID}/root:/{BASE_FOLDER}:/children",
+                headers=headers,
+                json={"name": folder_name, "folder": {}, "@microsoft.graph.conflictBehavior": "rename"},
+                timeout=120,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            print(f"[STORAGE DEBUG] OneDrive folder created: {payload.get('webUrl')}")
+            return {
+                "storage_type": "onedrive",
+                "folder_name": folder_name,
+                "local_folder": local_folder,
+                "web_url": payload.get("webUrl"),
+            }
+        except Exception as exc:
+            print(f"[STORAGE DEBUG] OneDrive folder creation failed, using local fallback: {exc}")
+
+    return local_folder
+
+def save_submission_files(folder_ref, full_name: str, fields: dict, document_urls: dict) -> dict:
+    """Save typed submission details and uploaded images into the folder."""
+    summary_lines = [
+        f"Submission for: {fields.get('full_name', full_name) or 'Unknown'}",
+        f"Email: {fields.get('email', '') or 'N/A'}",
+        f"Mobile: {fields.get('mobile_number', '') or 'N/A'}",
+        f"State: {fields.get('state', '') or 'N/A'}",
+        f"Car Registration: {fields.get('car_registration', '') or 'N/A'}",
+        f"Submission Date: {fields.get('submission_date', '') or 'N/A'}",
+        "",
+        "Document Links:",
+    ]
+    for key, value in document_urls.items():
+        summary_lines.append(f"- {key}: {value or 'Not provided'}")
+
+    summary_text = "\n".join(summary_lines) + "\n"
+
+    # Get folder name from folder_ref
+    if isinstance(folder_ref, dict):
+        folder_name = folder_ref.get("folder_name")
+        local_folder = folder_ref.get("local_folder") or STORAGE_ROOT
+        use_onedrive = folder_ref.get("storage_type") == "onedrive"
+    else:
+        folder_name = None
+        local_folder = folder_ref
+        use_onedrive = False
+
+    # ── Local storage path ──
+    if not use_onedrive:
+        os.makedirs(local_folder, exist_ok=True)
+        info_path = os.path.join(local_folder, "submission_details.txt")
+        with open(info_path, "w", encoding="utf-8") as handle:
+            handle.write(summary_text)
+
+        for name, url in document_urls.items():
+            if not url:
+                continue
+            try:
+                file_bytes = download_bytes_from_url(url)
+                if url.startswith("data:"):
+                    ext = ".png"
+                    if "image/jpeg" in url:
+                        ext = ".jpg"
+                else:
+                    ext = os.path.splitext(url.split("?")[0])[1] or ".bin"
+                file_path = os.path.join(local_folder, f"{sanitize_filename(name)}{ext}")
+                with open(file_path, "wb") as handle:
+                    handle.write(file_bytes)
+            except Exception as exc:
+                print(f"[STORAGE DEBUG] Failed to save local image {name}: {exc}")
+
+        return {"storage_type": "local", "folder": local_folder, "details_file": info_path}
+
+    # ── OneDrive upload path ──
+    if not DRIVE_ID or not folder_name:
+        print("[STORAGE DEBUG] OneDrive upload requested but DRIVE_ID or folder_name missing — saving locally.")
+        os.makedirs(local_folder, exist_ok=True)
+        info_path = os.path.join(local_folder, "submission_details.txt")
+        with open(info_path, "w", encoding="utf-8") as handle:
+            handle.write(summary_text)
+        return {"storage_type": "local", "folder": local_folder, "details_file": info_path}
+
+    token = get_graph_access_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    upload_results = {"storage_type": "onedrive", "folder": folder_name, "files": []}
+    base_path = f"{BASE_FOLDER}/{folder_name}"
+
+    # Upload submission details text file
+    try:
+        response = requests.put(
+            f"https://graph.microsoft.com/v1.0/drives/{DRIVE_ID}/root:/{base_path}/submission_details.txt:/content",
+            headers={**headers, "Content-Type": "text/plain"},
+            data=summary_text.encode("utf-8"),
+            timeout=120,
+        )
+        response.raise_for_status()
+        upload_results["files"].append("submission_details.txt")
+        print(f"[STORAGE DEBUG] Uploaded submission_details.txt")
+    except Exception as exc:
+        print(f"[STORAGE DEBUG] Failed to upload submission_details.txt: {exc}")
+
+    # Upload each document
+    for name, url in document_urls.items():
+        if not url:
+            continue
+        try:
+            file_bytes = download_bytes_from_url(url)
+            if url.startswith("data:"):
+                ext = ".png"
+                if "image/jpeg" in url:
+                    ext = ".jpg"
+            else:
+                ext = os.path.splitext(url.split("?")[0])[1] or ".bin"
+
+            filename = f"{sanitize_filename(name)}{ext}"
+            response = requests.put(
+                f"https://graph.microsoft.com/v1.0/drives/{DRIVE_ID}/root:/{base_path}/{filename}:/content",
+                headers={**headers, "Content-Type": "application/octet-stream"},
+                data=file_bytes,
+                timeout=120,
+            )
+            response.raise_for_status()
+            upload_results["files"].append(filename)
+            print(f"[STORAGE DEBUG] Uploaded {filename}")
+        except Exception as exc:
+            print(f"[STORAGE DEBUG] OneDrive upload failed for {name}: {exc}")
+
+    return upload_results
