@@ -160,6 +160,20 @@
   .stat-item.teal .stat-num { color: var(--teal); }
   .stat-item.gold .stat-num { color: var(--gold); }
 
+
+  /* Integration view */
+  .view-panel { display: block; }
+  .integration-page { padding: 28px; max-width: 900px; }
+  .integration-card { background: var(--surface-raised); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow); overflow: hidden; }
+  .integration-card-header { padding: 22px 24px 16px; border-bottom: 1px solid var(--border); }
+  .integration-card-header h1 { font-family: 'DM Serif Display', serif; font-size: 24px; letter-spacing: -0.02em; margin-bottom: 4px; }
+  .integration-card-header p { color: var(--ink-muted); font-size: 14px; }
+  .integration-card-body { padding: 22px 24px; display: flex; flex-direction: column; gap: 16px; }
+  .integration-actions { display: flex; gap: 10px; flex-wrap: wrap; padding-top: 6px; }
+  .integration-status { border: 1px solid var(--border); background: var(--surface); border-radius: 10px; padding: 14px 16px; color: var(--ink-muted); font-size: 13.5px; }
+  .integration-status strong { color: var(--ink); }
+  .help-text { color: var(--ink-muted); font-size: 13px; line-height: 1.5; }
+
   /* Loading spinner */
   .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); border-top-color: white; border-radius: 50%; animation: spin 0.7s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -236,11 +250,18 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
         Client
       </button>
+      <hr class="sidebar-divider" style="margin: 14px 0 12px;">
+      <div class="sidebar-label">Integrations</div>
+      <button class="sidebar-btn" onclick="showIntegrationView()" id="nav-integration">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/></svg>
+        Microsoft integration
+      </button>
     </div>
     <div style="height:16px"></div>
   </aside>
 
   <main>
+    <div id="candidate-view" class="view-panel">
     <div class="stats-bar">
       <div class="stat-item"><div class="stat-num" id="stat-total">—</div><div class="stat-label">Total</div></div>
       <div class="stat-item gold"><div class="stat-num" id="stat-active">—</div><div class="stat-label">In pipeline</div></div>
@@ -260,6 +281,47 @@
       <div class="empty-state" id="empty-state" style="display:none">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/></svg>
         <p>No candidates found</p><small>Try adjusting your search or filters</small>
+      </div>
+    </div>
+    </div>
+
+    <div id="integration-view" class="view-panel integration-page" style="display:none">
+      <div class="integration-card">
+        <div class="integration-card-header">
+          <h1>Microsoft SharePoint Integration</h1>
+          <p>Connect the website to Microsoft using delegated permissions. SharePoint site, drive and base folder stay configured on the backend.</p>
+        </div>
+        <div class="integration-card-body">
+          <div class="integration-status" id="integration-status">
+            Checking connection status…
+          </div>
+
+          <div class="field">
+            <label>Application / Client ID</label>
+            <input type="text" id="integration-client-id" placeholder="Paste Microsoft Application (client) ID">
+          </div>
+
+          <div class="field">
+            <label>Tenant ID</label>
+            <input type="text" id="integration-tenant-id" placeholder="Paste Microsoft Directory (tenant) ID">
+          </div>
+
+          <p class="help-text">
+            These values identify the Microsoft app and tenant. After saving, click Connect to sign in with a Microsoft account that has access to the target SharePoint document library.
+          </p>
+
+          <div class="integration-actions">
+            <button class="btn btn-primary" onclick="saveMicrosoftIntegration()" id="save-integration-btn">
+              Save settings
+            </button>
+            <button class="btn btn-ghost" onclick="connectMicrosoftIntegration()" id="connect-integration-btn">
+              Connect Microsoft
+            </button>
+            <button class="btn btn-ghost" onclick="loadMicrosoftIntegrationStatus()">
+              Refresh status
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   </main>
@@ -432,6 +494,83 @@ async function apiFetch(path, opts={}) {
   return res.json();
 }
 
+
+// ── View switching ──
+function showCandidatesView() {
+  document.getElementById('candidate-view').style.display = 'block';
+  document.getElementById('integration-view').style.display = 'none';
+  document.getElementById('nav-integration')?.classList.remove('active');
+}
+
+function showIntegrationView() {
+  document.getElementById('candidate-view').style.display = 'none';
+  document.getElementById('integration-view').style.display = 'block';
+  document.getElementById('nav-integration')?.classList.add('active');
+  loadMicrosoftIntegrationStatus();
+}
+
+// ── Microsoft integration ──
+async function loadMicrosoftIntegrationStatus() {
+  const statusEl = document.getElementById('integration-status');
+  if (!statusEl) return;
+
+  statusEl.textContent = 'Checking connection status…';
+
+  try {
+    const status = await apiFetch('/integration/microsoft/status');
+
+    document.getElementById('integration-client-id').value = status.client_id || '';
+    document.getElementById('integration-tenant-id').value = status.tenant_id || '';
+
+    if (status.connected) {
+      statusEl.innerHTML = `<strong>Connected</strong><br>Signed in as: ${esc(status.connected_user || 'Unknown user')}<br>Connected at: ${esc(status.connected_at || '—')}`;
+    } else if (status.configured) {
+      statusEl.innerHTML = '<strong>Configured but not connected</strong><br>Click Connect Microsoft to finish sign-in.';
+    } else {
+      statusEl.innerHTML = '<strong>Not configured</strong><br>Enter the Client ID and Tenant ID, then save the settings.';
+    }
+  } catch (e) {
+    statusEl.innerHTML = `<strong>Status unavailable</strong><br>${esc(e.message)}`;
+  }
+}
+
+async function saveMicrosoftIntegration() {
+  const clientId = document.getElementById('integration-client-id').value.trim();
+  const tenantId = document.getElementById('integration-tenant-id').value.trim();
+
+  if (!clientId || !tenantId) {
+    toast('Please enter both Client ID and Tenant ID', true);
+    return;
+  }
+
+  const btn = document.getElementById('save-integration-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Saving…';
+
+  try {
+    await apiFetch('/integration/microsoft', {
+      method: 'POST',
+      body: JSON.stringify({
+        client_id: clientId,
+        tenant_id: tenantId
+      })
+    });
+
+    toast('Microsoft integration settings saved');
+    await loadMicrosoftIntegrationStatus();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = 'Save settings';
+  }
+}
+
+function connectMicrosoftIntegration() {
+  window.location.href = API + '/integration/microsoft/connect';
+}
+
+
 async function loadCandidates() {
   const params = new URLSearchParams();
   if (activeStage !== 'All') params.set('stage', activeStage);
@@ -488,6 +627,7 @@ function render() {
 
 // ── Filters ──
 function filterStage(stage) {
+  showCandidatesView();
   activeStage = stage;
   document.querySelectorAll('[id^="filter-"]').forEach(b => b.classList.remove('active'));
   document.getElementById('filter-' + stage).classList.add('active');
@@ -495,6 +635,7 @@ function filterStage(stage) {
   loadCandidates();
 }
 function filterRole(role) {
+  showCandidatesView();
   activeRole = role;
   document.querySelectorAll('[id^="role-"]').forEach(b => b.classList.remove('active'));
   document.getElementById('role-' + role).classList.add('active');
