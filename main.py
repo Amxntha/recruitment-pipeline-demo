@@ -1,8 +1,9 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 # HELP AT HAND SUPPORT - Recruitment Pipeline API
 # ═══════════════════════════════════════════════════════════════════════════════
-# FastAPI app for managing recruitment candidates, receiving JotForm webhooks,
-# and saving uploaded submission documents to a SharePoint document library.
+# FastAPI app for managing recruitment candidates and receiving JotForm webhooks.
+# In this pure SPA design, FastAPI saves submissions locally while the browser
+# handles Microsoft sign-in and calls Microsoft Graph directly.
 
 # ───────────────────────────────────────────────────────────────────────────────
 # IMPORTS
@@ -23,11 +24,9 @@ from urllib.parse import quote
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from msal import PublicClientApplication, SerializableTokenCache
 from pydantic import BaseModel
-from starlette.middleware.sessions import SessionMiddleware
 
 load_dotenv()
 
@@ -37,21 +36,20 @@ load_dotenv()
 
 DB_PATH = os.getenv("DB_PATH", "hahs.db")
 STORAGE_ROOT = os.getenv("STORAGE_ROOT", "./local_storage")
-ALLOW_LOCAL_FALLBACK = os.getenv("ALLOW_LOCAL_FALLBACK", "false").lower() == "true"
 
-# SharePoint destination stays fixed in the backend environment.
+# Pure SPA / MSAL.js public-client settings. These values are sent to the
+# browser because the frontend performs Microsoft login and Graph API calls.
+MS_CLIENT_ID = os.getenv("MS_CLIENT_ID", os.getenv("CLIENT_ID", "")).strip()
+MS_TENANT_ID = os.getenv("MS_TENANT_ID", os.getenv("TENANT_ID", "")).strip()
+GRAPH_SCOPES = ["User.Read", "Sites.ReadWrite.All"]
+GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
+
+# SharePoint destination. The browser uses these values when syncing files.
 SITE_ID = os.getenv("SITE_ID", "").strip()
 DRIVE_ID = os.getenv("DRIVE_ID", "").strip()
 BASE_FOLDER = os.getenv("BASE_FOLDER", "HR Demo Candidate Log").strip().strip("/")
 
-# Client ID and Tenant ID are entered from the Integration tab and stored in DB.
-GRAPH_SCOPES = ["User.Read", "Sites.ReadWrite.All"]
-GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
-REDIRECT_URI = os.getenv("REDIRECT_URI")
-SESSION_SECRET_KEY = os.getenv("SESSION_SECRET_KEY")
-
 app = FastAPI(title="HelpAtHandSupport API")
-app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET_KEY)
 
 # ───────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -94,6 +92,8 @@ CANDIDATE_FIELDS = [
     "confirmation_agreed",
     "reference_1",
     "reference_2",
+    "local_folder_path",
+    "sharepoint_sync_status",
     "sharepoint_folder_id",
     "sharepoint_folder_url",
     "sharepoint_folder_path",
@@ -159,17 +159,6 @@ def init_db() -> None:
     )
 
     with get_conn() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS microsoft_integration (
-                id TEXT PRIMARY KEY,
-                client_id TEXT NOT NULL,
-                tenant_id TEXT NOT NULL,
-                token_cache TEXT,
-                connected_user TEXT,
-                connected_at TEXT,
-                created_at TEXT DEFAULT (datetime('now'))
-            )
-        """)
 
         conn.execute(f"""
             CREATE TABLE IF NOT EXISTS candidates (
@@ -229,12 +218,6 @@ def init_db() -> None:
 # PYDANTIC MODELS
 # ───────────────────────────────────────────────────────────────────────────────
 
-class MicrosoftIntegrationIn(BaseModel):
-    """Integration-tab payload for Microsoft delegated OAuth connection."""
-    client_id: str
-    tenant_id: str
-
-
 class CandidateIn(BaseModel):
     """Candidate input model for creating and updating candidates."""
     name: str
@@ -262,6 +245,8 @@ class CandidateIn(BaseModel):
     confirmation_agreed: Optional[str] = None
     reference_1: Optional[str] = None
     reference_2: Optional[str] = None
+    local_folder_path: Optional[str] = None
+    sharepoint_sync_status: Optional[str] = None
     sharepoint_folder_id: Optional[str] = None
     sharepoint_folder_url: Optional[str] = None
     sharepoint_folder_path: Optional[str] = None
@@ -272,227 +257,69 @@ class CandidateOut(CandidateIn):
     id: str
     created_at: str
 
+
+class SharePointSyncIn(BaseModel):
+    """Payload sent by the browser after it syncs local files to SharePoint."""
+    folder_id: Optional[str] = None
+    folder_url: Optional[str] = None
+    folder_path: Optional[str] = None
+    status: Optional[str] = "Synced"
+
 # ───────────────────────────────────────────────────────────────────────────────
-# MICROSOFT INTEGRATION / GRAPH AUTHENTICATION
+# PURE SPA / MICROSOFT GRAPH CONFIGURATION
 # ───────────────────────────────────────────────────────────────────────────────
 
-def get_microsoft_integration() -> Optional[dict]:
-    """Return the saved Microsoft integration, if configured."""
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT * FROM microsoft_integration WHERE id = ?",
-            (INTEGRATION_ID,),
-        ).fetchone()
-    return row_to_dict(row) if row else None
+@app.get("/api/spa-config")
+def spa_config():
+    """Return public Microsoft/SharePoint config for the browser SPA.
 
-
-def save_microsoft_integration(data: MicrosoftIntegrationIn) -> dict:
-    """Save Client ID and Tenant ID from the Integration tab."""
-    client_id = data.client_id.strip()
-    tenant_id = data.tenant_id.strip()
-
-    if not client_id or not tenant_id:
-        raise HTTPException(400, "Client ID and Tenant ID are required")
-
-    with get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO microsoft_integration (id, client_id, tenant_id)
-            VALUES (?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                client_id = excluded.client_id,
-                tenant_id = excluded.tenant_id,
-                token_cache = NULL,
-                connected_user = NULL,
-                connected_at = NULL
-            """,
-            (INTEGRATION_ID, client_id, tenant_id),
-        )
-        row = conn.execute(
-            "SELECT * FROM microsoft_integration WHERE id = ?",
-            (INTEGRATION_ID,),
-        ).fetchone()
-    return row_to_dict(row)
-
-
-def load_integration_token_cache(integration: dict) -> SerializableTokenCache:
-    """Load the MSAL token cache stored in SQLite."""
-    cache = SerializableTokenCache()
-    if integration.get("token_cache"):
-        cache.deserialize(integration["token_cache"])
-    return cache
-
-
-def save_integration_token_cache(cache: SerializableTokenCache) -> None:
-    """Persist the MSAL token cache to SQLite."""
-    if cache.has_state_changed:
-        with get_conn() as conn:
-            conn.execute(
-                "UPDATE microsoft_integration SET token_cache = ? WHERE id = ?",
-                (cache.serialize(), INTEGRATION_ID),
-            )
-
-
-def build_msal_app(
-    integration: dict,
-    cache: Optional[SerializableTokenCache] = None,
-) -> PublicClientApplication:
-    """Build MSAL public-client app from saved integration settings."""
-    authority = f"https://login.microsoftonline.com/{integration['tenant_id']}"
-    return PublicClientApplication(
-        client_id=integration["client_id"],
-        authority=authority,
-        token_cache=cache,
-    )
-
-
-def get_graph_access_token() -> str:
-    """Get a delegated Microsoft Graph token from the cached integration."""
-    integration = get_microsoft_integration()
-    if not integration:
-        raise HTTPException(401, "Microsoft integration has not been configured.")
-
-    cache = load_integration_token_cache(integration)
-    msal_app = build_msal_app(integration, cache)
-    accounts = msal_app.get_accounts()
-
-    if not accounts:
-        raise HTTPException(
-            401,
-            "Microsoft integration is not connected. Connect it from the Integration tab.",
-        )
-
-    result = msal_app.acquire_token_silent(scopes=GRAPH_SCOPES, account=accounts[0])
-    save_integration_token_cache(cache)
-
-    if not result or "access_token" not in result:
-        raise HTTPException(
-            401,
-            f"Could not get Microsoft Graph token. Reconnect Microsoft integration. Result: {result}",
-        )
-
-    return result["access_token"]
-
-
-def get_graph_headers(content_type: Optional[str] = None) -> dict:
-    """Build Microsoft Graph request headers."""
-    headers = {
-        "Authorization": f"Bearer {get_graph_access_token()}",
-        "Accept": "application/json",
-    }
-    if content_type:
-        headers["Content-Type"] = content_type
-    return headers
-
-
-def graph_request(method: str, url: str, **kwargs) -> requests.Response:
-    """Small wrapper for Microsoft Graph calls."""
-    timeout = kwargs.pop("timeout", 120)
-    return requests.request(method, url, timeout=timeout, **kwargs)
-
-
-@app.post("/api/integration/microsoft")
-def configure_microsoft_integration(data: MicrosoftIntegrationIn):
-    integration = save_microsoft_integration(data)
+    There is intentionally no client secret here. The frontend uses MSAL.js with
+    PKCE and calls Microsoft Graph directly from the browser.
+    """
     return {
-        "message": "Microsoft integration settings saved.",
-        "connect_url": "/api/integration/microsoft/connect",
-        "client_id": integration["client_id"],
-        "tenant_id": integration["tenant_id"],
+        "mode": "pure_spa_pkce",
+        "auth": {
+            "client_id": MS_CLIENT_ID,
+            "tenant_id": MS_TENANT_ID,
+            "authority": f"https://login.microsoftonline.com/{MS_TENANT_ID}" if MS_TENANT_ID else "",
+        },
+        "graph": {
+            "base_url": GRAPH_BASE_URL,
+            "scopes": GRAPH_SCOPES,
+            "site_id": SITE_ID,
+            "drive_id": DRIVE_ID,
+            "base_folder": BASE_FOLDER,
+        },
+        "configured": bool(MS_CLIENT_ID and MS_TENANT_ID and DRIVE_ID),
     }
 
 
 @app.get("/api/integration/microsoft/status")
 def microsoft_integration_status():
-    integration = get_microsoft_integration()
-    if not integration:
-        return {
-            "configured": False,
-            "connected": False,
-            "client_id": "",
-            "tenant_id": "",
-            "connected_user": "",
-            "connected_at": "",
-        }
+    """Compatibility endpoint used by the Integration tab.
 
+    In pure SPA mode, connection status is checked in the browser because the
+    browser owns the Microsoft account session and token cache.
+    """
     return {
-        "configured": True,
-        "connected": bool(integration.get("token_cache")),
-        "client_id": integration.get("client_id") or "",
-        "tenant_id": integration.get("tenant_id") or "",
-        "connected_user": integration.get("connected_user") or "",
-        "connected_at": integration.get("connected_at") or "",
+        "mode": "pure_spa_pkce",
+        "configured": bool(MS_CLIENT_ID and MS_TENANT_ID and DRIVE_ID),
+        "connected": False,
+        "client_id": MS_CLIENT_ID,
+        "tenant_id": MS_TENANT_ID,
+        "drive_id": DRIVE_ID,
+        "base_folder": BASE_FOLDER,
+        "message": "Microsoft sign-in and Graph API calls are handled by the browser using MSAL.js and PKCE.",
     }
 
 
 @app.get("/api/integration/microsoft/connect")
-def connect_microsoft(request: Request):
-    integration = get_microsoft_integration()
-    if not integration:
-        raise HTTPException(400, "Microsoft integration has not been configured yet.")
-
-    cache = load_integration_token_cache(integration)
-    msal_app = build_msal_app(integration, cache)
-    flow = msal_app.initiate_auth_code_flow(
-        scopes=GRAPH_SCOPES,
-        redirect_uri=REDIRECT_URI,
+def connect_microsoft_deprecated():
+    """This backend endpoint is not used in pure SPA mode."""
+    raise HTTPException(
+        410,
+        "Pure SPA mode uses the frontend Connect button with MSAL.js; the backend does not perform Microsoft sign-in.",
     )
-
-    request.session["auth_flow"] = flow
-    return RedirectResponse(flow["auth_uri"])
-
-
-@app.get("/auth/callback")
-def auth_callback(request: Request):
-    integration = get_microsoft_integration()
-    if not integration:
-        raise HTTPException(400, "Microsoft integration has not been configured.")
-
-    cache = load_integration_token_cache(integration)
-    msal_app = build_msal_app(integration, cache)
-    flow = request.session.get("auth_flow")
-
-    if not flow:
-        raise HTTPException(400, "Missing auth flow. Start again from the Integration tab.")
-
-    result = msal_app.acquire_token_by_auth_code_flow(flow, dict(request.query_params))
-    if "error" in result:
-        raise HTTPException(400, detail=result)
-
-    save_integration_token_cache(cache)
-    connected_user = result.get("id_token_claims", {}).get("preferred_username", "")
-
-    with get_conn() as conn:
-        conn.execute(
-            """
-            UPDATE microsoft_integration
-            SET connected_user = ?, connected_at = datetime('now')
-            WHERE id = ?
-            """,
-            (connected_user, INTEGRATION_ID),
-        )
-
-    return {
-        "message": "Microsoft SharePoint connection successful.",
-        "connected_user": connected_user,
-    }
-
-
-@app.get("/api/debug/token-claims")
-def debug_token_claims():
-    token = get_graph_access_token()
-    payload = token.split(".")[1]
-    payload += "=" * (-len(payload) % 4)
-    claims = json.loads(base64.urlsafe_b64decode(payload))
-
-    return {
-        "aud": claims.get("aud"),
-        "tenant_id": claims.get("tid"),
-        "app_id": claims.get("appid"),
-        "roles": claims.get("roles"),
-        "scp": claims.get("scp"),
-        "user": claims.get("preferred_username") or claims.get("upn"),
-    }
 
 # ───────────────────────────────────────────────────────────────────────────────
 # CANDIDATE HELPERS
@@ -761,110 +588,17 @@ def build_submission_summary(full_name: str, fields: dict, document_urls: dict) 
     return "\n".join(summary_lines) + "\n"
 
 
-def build_sharepoint_path(*parts: str) -> str:
-    """Build a SharePoint document-library path safely for Graph path-based URLs."""
-    cleaned_parts = [part.strip("/") for part in parts if part and part.strip("/")]
-    return "/".join(cleaned_parts)
-
-
-def encode_graph_path(path: str) -> str:
-    """Encode a SharePoint path while keeping folder separators."""
-    return quote(path, safe="/")
-
-
-def get_sharepoint_folder_by_path(path: str) -> Optional[dict]:
-    """Return a SharePoint folder driveItem by path, or None if it does not exist."""
-    if not DRIVE_ID:
-        return None
-
-    encoded_path = encode_graph_path(path)
-    response = graph_request(
-        "GET",
-        f"{GRAPH_BASE_URL}/drives/{DRIVE_ID}/root:/{encoded_path}",
-        headers=get_graph_headers(),
-    )
-
-    if response.status_code == 404:
-        return None
-
-    if response.status_code >= 400:
-        print("Graph status:", response.status_code)
-        print("Graph response:", response.text)
-
-    response.raise_for_status()
-    return response.json()
-
-
-def create_sharepoint_folder_under_base(folder_name: str) -> dict:
-    """Create a candidate folder under BASE_FOLDER in the SharePoint document library."""
-    if BASE_FOLDER:
-        encoded_base_folder = encode_graph_path(BASE_FOLDER)
-        create_folder_url = f"{GRAPH_BASE_URL}/drives/{DRIVE_ID}/root:/{encoded_base_folder}:/children"
-    else:
-        create_folder_url = f"{GRAPH_BASE_URL}/drives/{DRIVE_ID}/root/children"
-
-    response = graph_request(
-        "POST",
-        create_folder_url,
-        headers=get_graph_headers("application/json"),
-        json={
-            "name": folder_name,
-            "folder": {},
-            "@microsoft.graph.conflictBehavior": "fail",
-        },
-    )
-    response.raise_for_status()
-    return response.json()
-
-
-def create_submission_folder(cid: str) -> dict:
-    """Get or create the SharePoint folder for a candidate."""
-    if not DRIVE_ID:
-        message = "DRIVE_ID is missing. Cannot upload to the SharePoint document library."
-        if not ALLOW_LOCAL_FALLBACK:
-            raise HTTPException(500, message)
-        local_folder = os.path.join(STORAGE_ROOT, cid)
-        os.makedirs(local_folder, exist_ok=True)
-        return {"storage_type": "local", "folder_name": cid, "local_folder": local_folder}
-
-    folder_name = sanitize_filename(cid)
-    folder_path = build_sharepoint_path(BASE_FOLDER, folder_name)
-
-    existing_folder = get_sharepoint_folder_by_path(folder_path)
-    if existing_folder:
-        print(f"[STORAGE DEBUG] SharePoint folder already exists: {existing_folder.get('webUrl')}")
-        return {
-            "storage_type": "sharepoint",
-            "folder_name": folder_name,
-            "folder_path": folder_path,
-            "folder_id": existing_folder.get("id"),
-            "web_url": existing_folder.get("webUrl"),
-        }
-
-    try:
-        payload = create_sharepoint_folder_under_base(folder_name)
-        print(f"[STORAGE DEBUG] SharePoint folder created: {payload.get('webUrl')}")
-        return {
-            "storage_type": "sharepoint",
-            "folder_name": folder_name,
-            "folder_path": folder_path,
-            "folder_id": payload.get("id"),
-            "web_url": payload.get("webUrl"),
-        }
-    except requests.HTTPError as exc:
-        error_body = safe_json(exc.response) if getattr(exc, "response", None) is not None else str(exc)
-        message = f"SharePoint folder creation failed: {error_body}"
-        print(f"[STORAGE DEBUG] {message}")
-        if not ALLOW_LOCAL_FALLBACK:
-            raise HTTPException(500, message)
-
-        local_folder = os.path.join(STORAGE_ROOT, folder_name)
-        os.makedirs(local_folder, exist_ok=True)
-        return {"storage_type": "local", "folder_name": folder_name, "local_folder": local_folder}
+def candidate_local_folder(cid: str) -> str:
+    """Return the local storage folder for a candidate."""
+    return os.path.join(STORAGE_ROOT, sanitize_filename(cid))
 
 
 def save_local_submission_files(local_folder: str, summary_text: str, document_urls: dict) -> dict:
-    """Save submission details and documents to local storage. Used only when fallback is enabled."""
+    """Save submission details and documents to local storage.
+
+    This is the main fail-safe in pure SPA mode. The browser can later read
+    these local files through the API and upload them to SharePoint using Graph.
+    """
     os.makedirs(local_folder, exist_ok=True)
     info_path = os.path.join(local_folder, "submission_details.txt")
 
@@ -886,125 +620,13 @@ def save_local_submission_files(local_folder: str, summary_text: str, document_u
     return {"storage_type": "local", "folder": local_folder, "files": saved_files, "details_file": info_path}
 
 
-def upload_sharepoint_file(
-    folder_id: str,
-    filename: str,
-    content: bytes,
-    content_type: str,
-) -> dict:
-    """Upload one file into a SharePoint folder driveItem using Microsoft Graph."""
-    encoded_filename = quote(filename, safe="")
-    response = graph_request(
-        "PUT",
-        f"{GRAPH_BASE_URL}/drives/{DRIVE_ID}/items/{folder_id}:/{encoded_filename}:/content",
-        headers=get_graph_headers(content_type),
-        data=content,
-    )
-    response.raise_for_status()
-    return response.json()
-
-
-def save_sharepoint_submission_files(folder_ref: dict, summary_text: str, document_urls: dict) -> dict:
-    """Upload submission details and document files to the candidate's SharePoint folder."""
-    folder_id = folder_ref.get("folder_id")
-    if not folder_id:
-        raise HTTPException(500, "SharePoint folder ID is missing; cannot upload files.")
-
-    upload_results = {
-        "storage_type": "sharepoint",
-        "folder": folder_ref.get("folder_name"),
-        "folder_id": folder_id,
-        "web_url": folder_ref.get("web_url"),
-        "files": [],
-    }
-
-    try:
-        upload_sharepoint_file(
-            folder_id,
-            "submission_details.txt",
-            summary_text.encode("utf-8"),
-            "text/plain",
-        )
-        upload_results["files"].append("submission_details.txt")
-        print("[STORAGE DEBUG] Uploaded submission_details.txt")
-    except Exception as exc:
-        print(f"[STORAGE DEBUG] Failed to upload submission_details.txt: {exc}")
-
-    for name, url in document_urls.items():
-        if not url:
-            continue
-
-        filename = f"{sanitize_filename(name)}{get_file_extension(url)}"
-        try:
-            upload_sharepoint_file(
-                folder_id,
-                filename,
-                download_bytes_from_url(url),
-                "application/octet-stream",
-            )
-            upload_results["files"].append(filename)
-            print(f"[STORAGE DEBUG] Uploaded {filename}")
-        except Exception as exc:
-            print(f"[STORAGE DEBUG] SharePoint upload failed for {name}: {exc}")
-
-    return upload_results
-
-
-def save_submission_files(
-    folder_ref: dict,
-    cid: str,
-    full_name: str,
-    fields: dict,
-    document_urls: dict,
-) -> dict:
-    """Save typed submission details and uploaded documents to SharePoint/local fallback."""
-    fields = {**fields, "candidate_id": cid}
-    summary_text = build_submission_summary(full_name, fields, document_urls)
-
-    if folder_ref.get("storage_type") == "sharepoint":
-        return save_sharepoint_submission_files(folder_ref, summary_text, document_urls)
-
-    if folder_ref.get("storage_type") == "local" and ALLOW_LOCAL_FALLBACK:
-        return save_local_submission_files(
-            folder_ref.get("local_folder") or STORAGE_ROOT,
-            summary_text,
-            document_urls,
-        )
-
-    raise HTTPException(500, "Submission storage is not configured for SharePoint.")
-
-
-def update_candidate_sharepoint_info(cid: str, folder_ref: dict) -> None:
-    """Store the candidate's SharePoint folder metadata in the database."""
-    if folder_ref.get("storage_type") != "sharepoint":
-        return
-
-    with get_conn() as conn:
-        conn.execute(
-            """
-            UPDATE candidates
-            SET sharepoint_folder_id = ?,
-                sharepoint_folder_url = ?,
-                sharepoint_folder_path = ?
-            WHERE id = ?
-            """,
-            (
-                folder_ref.get("folder_id") or "",
-                folder_ref.get("web_url") or "",
-                folder_ref.get("folder_path") or "",
-                cid,
-            ),
-        )
-
-
 def save_candidate_submission(cid: str, candidate: CandidateIn, document_urls: dict) -> None:
-    """Create/find the candidate SharePoint folder and save the JotForm files."""
-    folder_ref = create_submission_folder(cid)
-    save_submission_files(
-        folder_ref,
-        cid,
+    """Save the JotForm submission locally for later browser-based SharePoint sync."""
+    local_folder = candidate_local_folder(cid)
+    summary_text = build_submission_summary(
         candidate.name,
         {
+            "candidate_id": cid,
             "full_name": candidate.name,
             "email": candidate.email,
             "mobile_number": candidate.mobile_number,
@@ -1014,8 +636,24 @@ def save_candidate_submission(cid: str, candidate: CandidateIn, document_urls: d
         },
         document_urls,
     )
-    update_candidate_sharepoint_info(cid, folder_ref)
-    print("[STORAGE DEBUG] Submission files saved to folder", folder_ref)
+
+    storage_result = save_local_submission_files(local_folder, summary_text, document_urls)
+
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE candidates
+            SET local_folder_path = ?,
+                sharepoint_sync_status = CASE
+                    WHEN sharepoint_folder_url IS NOT NULL AND sharepoint_folder_url != '' THEN sharepoint_sync_status
+                    ELSE 'Pending browser sync'
+                END
+            WHERE id = ?
+            """,
+            (local_folder, cid),
+        )
+
+    print("[STORAGE DEBUG] Submission files saved locally", storage_result)
 
 # ───────────────────────────────────────────────────────────────────────────────
 # API ROUTES - WEBHOOK
@@ -1104,6 +742,100 @@ def create_candidate(data: CandidateIn):
         created = insert_candidate_record(conn, data)
     print(f"[WEBHOOK DEBUG] candidate UUID: {created.get('id')}")
     return created
+
+
+@app.get("/api/candidates/{cid}/local-files")
+def list_candidate_local_files(cid: str):
+    """List locally saved files for a candidate so the browser can sync them to SharePoint."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
+
+    if not row:
+        raise HTTPException(404, "Candidate not found")
+
+    candidate = row_to_dict(row)
+    local_folder = candidate.get("local_folder_path") or candidate_local_folder(cid)
+    if not os.path.isdir(local_folder):
+        return {
+            "candidate_id": cid,
+            "folder_name": sanitize_filename(cid),
+            "folder_exists": False,
+            "files": [],
+            "message": "No local files were found for this candidate.",
+        }
+
+    files = []
+    for filename in sorted(os.listdir(local_folder)):
+        file_path = os.path.join(local_folder, filename)
+        if not os.path.isfile(file_path):
+            continue
+        files.append({
+            "filename": filename,
+            "size_bytes": os.path.getsize(file_path),
+            "download_url": f"/api/candidates/{cid}/files/{quote(filename, safe='')}",
+        })
+
+    return {
+        "candidate_id": cid,
+        "candidate_name": candidate.get("name") or "",
+        "folder_name": sanitize_filename(cid),
+        "folder_exists": True,
+        "drive_id": DRIVE_ID,
+        "base_folder": BASE_FOLDER,
+        "files": files,
+    }
+
+
+@app.get("/api/candidates/{cid}/files/{filename:path}")
+def download_candidate_local_file(cid: str, filename: str):
+    """Serve one locally saved candidate file to the browser."""
+    safe_filename = os.path.basename(filename)
+    if safe_filename != filename:
+        raise HTTPException(400, "Invalid filename")
+
+    with get_conn() as conn:
+        row = conn.execute("SELECT local_folder_path FROM candidates WHERE id = ?", (cid,)).fetchone()
+
+    if not row:
+        raise HTTPException(404, "Candidate not found")
+
+    local_folder = row["local_folder_path"] or candidate_local_folder(cid)
+    file_path = os.path.join(local_folder, safe_filename)
+
+    if not os.path.isfile(file_path):
+        raise HTTPException(404, "Local file not found")
+
+    return FileResponse(file_path, filename=safe_filename)
+
+
+@app.post("/api/candidates/{cid}/sharepoint-sync", response_model=CandidateOut)
+def update_candidate_sharepoint_sync(cid: str, data: SharePointSyncIn):
+    """Store SharePoint metadata after the browser uploads local files using Graph."""
+    with get_conn() as conn:
+        existing = conn.execute("SELECT id FROM candidates WHERE id = ?", (cid,)).fetchone()
+        if not existing:
+            raise HTTPException(404, "Candidate not found")
+
+        conn.execute(
+            """
+            UPDATE candidates
+            SET sharepoint_folder_id = ?,
+                sharepoint_folder_url = ?,
+                sharepoint_folder_path = ?,
+                sharepoint_sync_status = ?
+            WHERE id = ?
+            """,
+            (
+                data.folder_id or "",
+                data.folder_url or "",
+                data.folder_path or "",
+                data.status or "Synced",
+                cid,
+            ),
+        )
+        row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
+
+    return row_to_dict(row)
 
 
 @app.get("/api/candidates/{cid}", response_model=CandidateOut)

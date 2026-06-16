@@ -289,33 +289,26 @@
       <div class="integration-card">
         <div class="integration-card-header">
           <h1>Microsoft SharePoint Integration</h1>
-          <p>Connect the website to Microsoft using delegated permissions. SharePoint site, drive and base folder stay configured on the backend.</p>
+          <p>Pure SPA mode: the browser signs in with Microsoft using PKCE and calls Microsoft Graph directly.</p>
         </div>
         <div class="integration-card-body">
           <div class="integration-status" id="integration-status">
             Checking connection status…
           </div>
 
-          <div class="field">
-            <label>Application / Client ID</label>
-            <input type="text" id="integration-client-id" placeholder="Paste Microsoft Application (client) ID">
-          </div>
-
-          <div class="field">
-            <label>Tenant ID</label>
-            <input type="text" id="integration-tenant-id" placeholder="Paste Microsoft Directory (tenant) ID">
-          </div>
-
-          <p class="help-text">
-            These values identify the Microsoft app and tenant. After saving, click Connect to sign in with a Microsoft account that has access to the target SharePoint document library.
+          <p class="help-text" id="integration-config-summary">
+            FastAPI receives JotForm webhooks and saves candidate files locally. This page uses the signed-in browser session to sync those local files to SharePoint.
           </p>
 
           <div class="integration-actions">
-            <button class="btn btn-primary" onclick="saveMicrosoftIntegration()" id="save-integration-btn">
-              Save settings
-            </button>
-            <button class="btn btn-ghost" onclick="connectMicrosoftIntegration()" id="connect-integration-btn">
+            <button class="btn btn-primary" onclick="connectMicrosoftIntegration()" id="connect-integration-btn">
               Connect Microsoft
+            </button>
+            <button class="btn btn-ghost" onclick="testMicrosoftGraphConnection()" id="test-graph-btn">
+              Test Graph access
+            </button>
+            <button class="btn btn-ghost" onclick="syncPendingSharePoint()" id="sync-sharepoint-btn">
+              Sync pending files to SharePoint
             </button>
             <button class="btn btn-ghost" onclick="loadMicrosoftIntegrationStatus()">
               Refresh status
@@ -402,6 +395,7 @@
 
 <div class="toast" id="toast"></div>
 
+<script src="https://alcdn.msauth.net/browser/2.38.0/js/msal-browser.min.js"></script>
 <script>
 const API = '/api';
 const STAGES = ['Shortlisted','Screening Call','Documents Requested','Documents Received','Interviewed','Hired'];
@@ -414,6 +408,15 @@ let activeStage = 'All';
 let activeRole = 'All';
 let searchQuery = '';
 let searchTimer = null;
+let microsoftConfig = null;
+let msalInstance = null;
+let currentMicrosoftAccount = null;
+let autoSharePointSyncRunning = false;
+let liveRefreshRunning = false;
+let lastCandidateSnapshot = '';
+
+const LIVE_REFRESH_INTERVAL_MS = 20000;
+const AUTO_SYNC_INTERVAL_MS = 60000;
 
 function avatarColor(name) { let h=0; for(let c of name) h=(h*31+c.charCodeAt(0))%COLORS.length; return COLORS[h]; }
 function initials(name) { return name.split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase(); }
@@ -509,75 +512,372 @@ function showIntegrationView() {
   loadMicrosoftIntegrationStatus();
 }
 
-// ── Microsoft integration ──
+// ── Microsoft pure SPA / Graph integration ──
+async function loadMicrosoftConfig() {
+  if (microsoftConfig && msalInstance) return microsoftConfig;
+
+  microsoftConfig = await apiFetch('/spa-config');
+  const auth = microsoftConfig.auth || {};
+
+  if (!auth.client_id || !auth.tenant_id) {
+    throw new Error('Microsoft Client ID and Tenant ID are missing from the backend .env file.');
+  }
+
+  msalInstance = new msal.PublicClientApplication({
+    auth: {
+      clientId: auth.client_id,
+      authority: auth.authority,
+      redirectUri: `${window.location.origin}/auth/callback`
+    },
+    cache: {
+      cacheLocation: 'sessionStorage',
+      storeAuthStateInCookie: false
+    }
+  });
+
+  // Safe for popup-based login and also supports future redirect-based login.
+  const redirectResult = await msalInstance.handleRedirectPromise();
+  if (redirectResult && redirectResult.account) {
+    currentMicrosoftAccount = redirectResult.account;
+    msalInstance.setActiveAccount(redirectResult.account);
+  }
+
+  return microsoftConfig;
+}
+
+function getSignedInMicrosoftAccount() {
+  if (!msalInstance) return null;
+  const active = msalInstance.getActiveAccount?.();
+  if (active) return active;
+
+  const accounts = msalInstance.getAllAccounts();
+  if (accounts.length > 0) {
+    msalInstance.setActiveAccount(accounts[0]);
+    currentMicrosoftAccount = accounts[0];
+    return accounts[0];
+  }
+  return null;
+}
+
+function graphPathEncode(path) {
+  return String(path || '')
+    .split('/')
+    .filter(Boolean)
+    .map(part => encodeURIComponent(part))
+    .join('/');
+}
+
 async function loadMicrosoftIntegrationStatus() {
   const statusEl = document.getElementById('integration-status');
+  const configEl = document.getElementById('integration-config-summary');
   if (!statusEl) return;
 
   statusEl.textContent = 'Checking connection status…';
 
   try {
-    const status = await apiFetch('/integration/microsoft/status');
+    const config = await loadMicrosoftConfig();
+    const account = getSignedInMicrosoftAccount();
+    const graph = config.graph || {};
 
-    document.getElementById('integration-client-id').value = status.client_id || '';
-    document.getElementById('integration-tenant-id').value = status.tenant_id || '';
+    if (configEl) {
+      configEl.innerHTML = `
+        <strong>Mode:</strong> Pure SPA + PKCE<br>
+        <strong>SharePoint drive:</strong> ${esc(graph.drive_id || 'Not configured')}<br>
+        <strong>Base folder:</strong> ${esc(graph.base_folder || 'Root of drive')}
+      `;
+    }
 
-    if (status.connected) {
-      statusEl.innerHTML = `<strong>Connected</strong><br>Signed in as: ${esc(status.connected_user || 'Unknown user')}<br>Connected at: ${esc(status.connected_at || '—')}`;
-    } else if (status.configured) {
-      statusEl.innerHTML = '<strong>Configured but not connected</strong><br>Click Connect Microsoft to finish sign-in.';
+    if (!config.configured) {
+      statusEl.innerHTML = '<strong>Backend configuration incomplete</strong><br>Check MS_CLIENT_ID, MS_TENANT_ID and DRIVE_ID in the .env file.';
+    } else if (account) {
+      statusEl.innerHTML = `<strong>Connected in this browser</strong><br>Signed in as: ${esc(account.username || account.name || 'Unknown user')}`;
     } else {
-      statusEl.innerHTML = '<strong>Not configured</strong><br>Enter the Client ID and Tenant ID, then save the settings.';
+      statusEl.innerHTML = '<strong>Configured but not signed in</strong><br>Click Connect Microsoft to sign in using this browser.';
     }
   } catch (e) {
     statusEl.innerHTML = `<strong>Status unavailable</strong><br>${esc(e.message)}`;
   }
 }
 
-async function saveMicrosoftIntegration() {
-  const clientId = document.getElementById('integration-client-id').value.trim();
-  const tenantId = document.getElementById('integration-tenant-id').value.trim();
-
-  if (!clientId || !tenantId) {
-    toast('Please enter both Client ID and Tenant ID', true);
-    return;
-  }
-
-  const btn = document.getElementById('save-integration-btn');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Saving…';
+async function connectMicrosoftIntegration() {
+  const btn = document.getElementById('connect-integration-btn');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Connecting…'; }
 
   try {
-    await apiFetch('/integration/microsoft', {
-      method: 'POST',
-      body: JSON.stringify({
-        client_id: clientId,
-        tenant_id: tenantId
-      })
+    const config = await loadMicrosoftConfig();
+    const result = await msalInstance.loginPopup({
+      scopes: config.graph.scopes
     });
+    currentMicrosoftAccount = result.account;
+    msalInstance.setActiveAccount(result.account);
+    toast('Microsoft connected in this browser');
+    await loadMicrosoftIntegrationStatus();
+    await autoSyncPendingSharePoint('Microsoft connected');
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = 'Connect Microsoft'; }
+  }
+}
 
-    toast('Microsoft integration settings saved');
+async function getGraphToken(options = {}) {
+  const interactive = options.interactive !== false;
+  const config = await loadMicrosoftConfig();
+  let account = getSignedInMicrosoftAccount();
+
+  if (!account) {
+    if (!interactive) {
+      throw new Error('Microsoft is not connected in this browser.');
+    }
+
+    const result = await msalInstance.loginPopup({ scopes: config.graph.scopes });
+    account = result.account;
+    msalInstance.setActiveAccount(account);
+  }
+
+  try {
+    const tokenResponse = await msalInstance.acquireTokenSilent({
+      scopes: config.graph.scopes,
+      account
+    });
+    return tokenResponse.accessToken;
+  } catch (e) {
+    if (!interactive) {
+      throw new Error('Silent Microsoft token refresh failed. Use Connect Microsoft or manual sync.');
+    }
+
+    const tokenResponse = await msalInstance.acquireTokenPopup({
+      scopes: config.graph.scopes,
+      account
+    });
+    return tokenResponse.accessToken;
+  }
+}
+
+async function graphFetch(path, options={}) {
+  const config = await loadMicrosoftConfig();
+  const token = await getGraphToken({ interactive: options.interactive !== false });
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    ...(options.headers || {})
+  };
+
+  if (options.contentType) headers['Content-Type'] = options.contentType;
+
+  const response = await fetch((config.graph.base_url || 'https://graph.microsoft.com/v1.0') + path, {
+    method: options.method || 'GET',
+    headers,
+    body: options.body
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Graph API failed (${response.status}): ${text}`);
+  }
+
+  if (response.status === 204) return null;
+  return response.json();
+}
+
+async function testMicrosoftGraphConnection() {
+  const btn = document.getElementById('test-graph-btn');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Testing…'; }
+
+  try {
+    const me = await graphFetch('/me');
+    toast(`Graph connected as ${me.userPrincipalName || me.mail || me.displayName || 'Microsoft user'}`);
     await loadMicrosoftIntegrationStatus();
   } catch (e) {
     toast(e.message, true);
   } finally {
-    btn.disabled = false;
-    btn.innerHTML = 'Save settings';
+    if (btn) { btn.disabled = false; btn.innerHTML = 'Test Graph access'; }
   }
 }
 
-function connectMicrosoftIntegration() {
-  window.location.href = API + '/integration/microsoft/connect';
+async function ensureSharePointCandidateFolder(folderName, options = {}) {
+  const config = await loadMicrosoftConfig();
+  const driveId = config.graph.drive_id;
+  const baseFolder = config.graph.base_folder || '';
+  const folderPath = [baseFolder, folderName].filter(Boolean).join('/');
+  const encodedFolderPath = graphPathEncode(folderPath);
+  const graphOptions = { interactive: options.interactive !== false };
+
+  // Reuse the folder if it already exists.
+  try {
+    return await graphFetch(`/drives/${driveId}/root:/${encodedFolderPath}`, graphOptions);
+  } catch (e) {
+    // Continue and try to create it.
+  }
+
+  const createPath = baseFolder
+    ? `/drives/${driveId}/root:/${graphPathEncode(baseFolder)}:/children`
+    : `/drives/${driveId}/root/children`;
+
+  try {
+    return await graphFetch(createPath, {
+      method: 'POST',
+      contentType: 'application/json',
+      interactive: options.interactive !== false,
+      body: JSON.stringify({
+        name: folderName,
+        folder: {},
+        '@microsoft.graph.conflictBehavior': 'fail'
+      })
+    });
+  } catch (e) {
+    // If another sync created it between the GET and POST, fetch it again.
+    return await graphFetch(`/drives/${driveId}/root:/${encodedFolderPath}`, graphOptions);
+  }
 }
 
+async function uploadLocalFileToSharePoint(folderId, fileInfo, options = {}) {
+  const config = await loadMicrosoftConfig();
+  const driveId = config.graph.drive_id;
 
-async function loadCandidates() {
+  const localResponse = await fetch(fileInfo.download_url);
+  if (!localResponse.ok) {
+    throw new Error(`Could not read local file ${fileInfo.filename}`);
+  }
+
+  const blob = await localResponse.blob();
+  const filename = encodeURIComponent(fileInfo.filename);
+
+  return graphFetch(`/drives/${driveId}/items/${folderId}:/${filename}:/content`, {
+    method: 'PUT',
+    contentType: 'application/octet-stream',
+    interactive: options.interactive !== false,
+    body: blob
+  });
+}
+
+async function syncCandidateToSharePoint(candidateId, options = {}) {
+  const localInfo = await apiFetch(`/candidates/${candidateId}/local-files`);
+
+  if (!localInfo.folder_exists || !localInfo.files.length) {
+    throw new Error(`No local files found for ${localInfo.candidate_name || candidateId}`);
+  }
+
+  const folder = await ensureSharePointCandidateFolder(localInfo.folder_name, options);
+
+  for (const fileInfo of localInfo.files) {
+    await uploadLocalFileToSharePoint(folder.id, fileInfo, options);
+  }
+
+  const folderPath = [localInfo.base_folder, localInfo.folder_name].filter(Boolean).join('/');
+  await apiFetch(`/candidates/${candidateId}/sharepoint-sync`, {
+    method: 'POST',
+    body: JSON.stringify({
+      folder_id: folder.id,
+      folder_url: folder.webUrl,
+      folder_path: folderPath,
+      status: 'Synced'
+    })
+  });
+}
+
+async function syncPendingSharePoint(options = {}) {
+  const manual = options.manual !== false;
+  const interactive = options.interactive !== false;
+  const btn = document.getElementById('sync-sharepoint-btn');
+
+  if (manual && btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Syncing…';
+  }
+
+  try {
+    // Always check all candidates, not only the current filtered/searched view.
+    const allCandidates = await apiFetch('/candidates');
+    const pending = allCandidates.filter(c => !c.sharepoint_folder_url);
+
+    if (!pending.length) {
+      if (manual) toast('No pending local files to sync');
+      return { successCount: 0, pendingCount: 0 };
+    }
+
+    let successCount = 0;
+    for (const candidate of pending) {
+      try {
+        await syncCandidateToSharePoint(candidate.id, { interactive });
+        successCount += 1;
+      } catch (candidateError) {
+        console.error(`[SHAREPOINT SYNC] Failed for ${candidate.name || candidate.id}:`, candidateError);
+        if (manual) {
+          throw candidateError;
+        }
+      }
+    }
+
+    if (successCount > 0) {
+      await refresh();
+      await loadMicrosoftIntegrationStatus();
+    }
+
+    if (manual) {
+      toast(`Synced ${successCount} candidate${successCount !== 1 ? 's' : ''} to SharePoint`);
+    }
+
+    return { successCount, pendingCount: pending.length };
+  } catch (e) {
+    if (manual) {
+      toast(e.message, true);
+    } else {
+      console.warn('[AUTO SYNC] Skipped or failed:', e.message);
+    }
+    return { successCount: 0, pendingCount: 0, error: e.message };
+  } finally {
+    if (manual && btn) {
+      btn.disabled = false;
+      btn.innerHTML = 'Sync pending files to SharePoint';
+    }
+  }
+}
+
+async function autoSyncPendingSharePoint(reason = 'auto') {
+  if (autoSharePointSyncRunning) {
+    console.log('[AUTO SYNC] Already running, skipping.');
+    return;
+  }
+
+  if (!getSignedInMicrosoftAccount()) {
+    console.log('[AUTO SYNC] Microsoft not connected, skipping.');
+    return;
+  }
+
+  autoSharePointSyncRunning = true;
+  try {
+    console.log(`[AUTO SYNC] Checking pending SharePoint files: ${reason}`);
+    const result = await syncPendingSharePoint({ manual: false, interactive: false });
+    if (result.successCount > 0) {
+      toast(`Auto-synced ${result.successCount} candidate${result.successCount !== 1 ? 's' : ''} to SharePoint`);
+    }
+  } finally {
+    autoSharePointSyncRunning = false;
+  }
+}
+
+async function loadCandidates(options = {}) {
   const params = new URLSearchParams();
   if (activeStage !== 'All') params.set('stage', activeStage);
   if (activeRole !== 'All') params.set('role', activeRole);
   if (searchQuery) params.set('q', searchQuery);
-  candidates = await apiFetch('/candidates?' + params.toString());
+
+  const nextCandidates = await apiFetch('/candidates?' + params.toString());
+  const nextSnapshot = JSON.stringify(nextCandidates.map(c => ({
+    id: c.id,
+    name: c.name,
+    stage: c.stage,
+    sharepoint_folder_url: c.sharepoint_folder_url || '',
+    updated: c.created_at || ''
+  })));
+
+  candidates = nextCandidates;
   render();
+
+  if (options.showNewCandidateToast && lastCandidateSnapshot && nextSnapshot !== lastCandidateSnapshot) {
+    toast('Candidate list updated');
+  }
+  lastCandidateSnapshot = nextSnapshot;
 }
 
 async function loadStats() {
@@ -594,7 +894,52 @@ async function loadStats() {
   });
 }
 
-function refresh() { loadCandidates(); loadStats(); }
+async function refresh(options = {}) {
+  await Promise.all([
+    loadCandidates(options),
+    loadStats()
+  ]);
+}
+
+async function refreshCandidatesNaturally(reason = 'periodic') {
+  if (liveRefreshRunning) return;
+  liveRefreshRunning = true;
+
+  try {
+    await refresh({ showNewCandidateToast: reason !== 'startup' });
+    await autoSyncPendingSharePoint(`candidate refresh: ${reason}`);
+  } catch (e) {
+    console.warn('[LIVE REFRESH] Failed:', e.message);
+  } finally {
+    liveRefreshRunning = false;
+  }
+}
+
+function startNaturalRefreshAndAutoSync() {
+  // First automatic check shortly after the page is ready.
+  setTimeout(() => refreshCandidatesNaturally('initial delayed check'), 3000);
+
+  // Keep the dashboard naturally updated while the site is open.
+  setInterval(() => {
+    if (!document.hidden) {
+      refreshCandidatesNaturally('scheduled refresh');
+    }
+  }, LIVE_REFRESH_INTERVAL_MS);
+
+  // Run a SharePoint sync check less frequently in case files were left pending.
+  setInterval(() => {
+    if (!document.hidden) {
+      autoSyncPendingSharePoint('scheduled sync');
+    }
+  }, AUTO_SYNC_INTERVAL_MS);
+
+  // Refresh immediately when the user returns to the tab.
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+      refreshCandidatesNaturally('tab became active');
+    }
+  });
+}
 
 // ── Render ──
 function render() {
@@ -836,7 +1181,19 @@ function toast(msg, isError=false) {
 
 document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeModal(); closeDetail(); } });
 
-refresh();
+async function initialisePage() {
+  try {
+    await loadMicrosoftConfig();
+  } catch (e) {
+    console.warn('[INIT] Microsoft config unavailable:', e.message);
+  }
+
+  await refresh({ showNewCandidateToast: false });
+  await loadMicrosoftIntegrationStatus();
+  startNaturalRefreshAndAutoSync();
+}
+
+initialisePage();
 </script>
 </body>
 </html>
