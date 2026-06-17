@@ -174,6 +174,14 @@
   .integration-status strong { color: var(--ink); }
   .help-text { color: var(--ink-muted); font-size: 13px; line-height: 1.5; }
 
+
+  .local-doc-item { margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+  .local-doc-item:last-child { border-bottom: none; }
+  .local-doc-meta { color: var(--ink-light); font-size: 12px; margin-top: 2px; }
+  .local-doc-link { display: inline-flex; margin-top: 6px; color: var(--accent); text-decoration: none; font-weight: 500; }
+  .local-doc-link:hover { text-decoration: underline; }
+  .doc-error-list { color: #8B2020; background: #FDF2F2; border: 1px solid #E8BEBC; border-radius: 8px; padding: 10px 12px; margin-top: 12px; }
+
   /* Loading spinner */
   .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); border-top-color: white; border-radius: 50%; animation: spin 0.7s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -289,7 +297,7 @@
       <div class="integration-card">
         <div class="integration-card-header">
           <h1>Microsoft SharePoint Integration</h1>
-          <p>Pure SPA mode: the browser signs in with Microsoft using PKCE and calls Microsoft Graph directly.</p>
+          <p>Connect Microsoft, choose the SharePoint site, select the document library, and set the folder used for candidate uploads.</p>
         </div>
         <div class="integration-card-body">
           <div class="integration-status" id="integration-status">
@@ -297,7 +305,7 @@
           </div>
 
           <p class="help-text" id="integration-config-summary">
-            FastAPI receives JotForm webhooks and saves candidate files locally. This page uses the signed-in browser session to sync those local files to SharePoint.
+            FastAPI receives JotForm webhooks and saves candidate files locally. This page uses the signed-in browser session to discover SharePoint locations and sync saved local files to the selected folder.
           </p>
 
           <div class="integration-actions">
@@ -312,6 +320,41 @@
             </button>
             <button class="btn btn-ghost" onclick="loadMicrosoftIntegrationStatus()">
               Refresh status
+            </button>
+          </div>
+
+          <hr style="border:0;border-top:1px solid var(--border);margin:8px 0;">
+
+          <div class="integration-status" id="sharepoint-destination-summary">
+            No SharePoint destination selected yet.
+          </div>
+
+          <div class="field">
+            <label>Step 1: Search SharePoint site</label>
+            <div style="display:flex; gap:10px; align-items:center;">
+              <input type="text" id="sharepoint-site-search" placeholder="Search by site name, e.g. HR or Recruitment" style="flex:1;">
+              <button class="btn btn-ghost" onclick="searchSharePointSites()" id="search-sites-btn">Search sites</button>
+            </div>
+            <small class="help-text">The site ID is used internally for Graph API calls but is not shown on the page.</small>
+          </div>
+          <div id="sharepoint-site-results" class="integration-status" style="display:none;"></div>
+
+          <div class="field">
+            <label>Step 2: Select document library</label>
+            <div id="sharepoint-drive-results" class="integration-status">
+              Select a SharePoint site first. Available document libraries will appear here.
+            </div>
+          </div>
+
+          <div class="field">
+            <label>Step 3: Base folder</label>
+            <input type="text" id="sharepoint-base-folder" placeholder="HR Demo Candidate Log">
+            <small class="help-text">Candidate folders will be created inside this folder. If it does not exist, the sync process will create it.</small>
+          </div>
+
+          <div class="integration-actions">
+            <button class="btn btn-primary" onclick="saveSharePointDestination()" id="save-destination-btn">
+              Save SharePoint destination
             </button>
           </div>
         </div>
@@ -411,6 +454,9 @@ let searchTimer = null;
 let microsoftConfig = null;
 let msalInstance = null;
 let currentMicrosoftAccount = null;
+let sharePointDestination = null;
+let selectedSharePointSite = null;
+let selectedSharePointDrive = null;
 let autoSharePointSyncRunning = false;
 let liveRefreshRunning = false;
 let lastCandidateSnapshot = '';
@@ -458,6 +504,75 @@ function linkOrImage(value) {
 }
 
 function docEntry(label, value) { return value ? `<div><strong>${esc(label)}:</strong> ${linkOrImage(value)}</div>` : ''; }
+
+function formatBytes(bytes) {
+  const n = Number(bytes || 0);
+  if (!n) return '0 B';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function localDocumentHtml(fileInfo) {
+  const url = fileInfo.download_url;
+  const label = fileInfo.label || fileInfo.filename;
+  const filename = fileInfo.filename || '';
+  const contentType = (fileInfo.content_type || '').toLowerCase();
+  const detectedType = fileInfo.detected_type || contentType || 'Saved file';
+  const meta = `${esc(filename)} • ${esc(detectedType)} • ${formatBytes(fileInfo.size_bytes)}`;
+
+  let preview = '';
+  if (contentType.startsWith('image/')) {
+    preview = `<div class="doc-image-wrap"><a href="${esc(url)}" target="_blank" rel="noreferrer" title="Open full file"><img class="doc-image" src="${esc(url)}" alt="${esc(label)}"></a></div>`;
+  } else if (contentType === 'application/pdf') {
+    preview = `<a class="local-doc-link" href="${esc(url)}" target="_blank" rel="noreferrer">Open PDF</a>`;
+  } else if (contentType.startsWith('text/')) {
+    preview = `<a class="local-doc-link" href="${esc(url)}" target="_blank" rel="noreferrer">Open text file</a>`;
+  } else {
+    preview = `<a class="local-doc-link" href="${esc(url)}" target="_blank" rel="noreferrer">Download file</a>`;
+  }
+
+  return `<div class="local-doc-item"><strong>${esc(label)}</strong><div class="local-doc-meta">${meta}</div>${preview}</div>`;
+}
+
+function referenceSectionHtml(referenceEntries) {
+  if (!referenceEntries.length) return '';
+  return `<div style="margin-top:14px; font-weight:600;">References</div>${referenceEntries.join('<br><br>')}`;
+}
+
+async function renderCandidateSavedDocuments(candidate, referenceEntries = []) {
+  const target = document.getElementById('dp-documents');
+  target.innerHTML = 'Loading saved local documents…';
+
+  try {
+    const localInfo = await apiFetch(`/candidates/${candidate.id}/local-files`);
+    const entries = [];
+
+    if (localInfo.folder_exists && localInfo.files && localInfo.files.length) {
+      entries.push(...localInfo.files.map(localDocumentHtml));
+    } else {
+      entries.push('<div>No saved local documents were found for this candidate.</div>');
+    }
+
+    if (localInfo.sharepoint_folder_url || candidate.sharepoint_folder_url) {
+      const sharepointUrl = localInfo.sharepoint_folder_url || candidate.sharepoint_folder_url;
+      entries.push(`<div style="margin-top:14px;"><strong>SharePoint:</strong> <a href="${esc(sharepointUrl)}" target="_blank" rel="noreferrer">Open synced folder</a></div>`);
+    }
+
+    if (localInfo.errors && localInfo.errors.length) {
+      const errors = localInfo.errors.map(e => `<li><strong>${esc(e.label || e.document_key || 'File')}</strong>: ${esc(e.error || 'Failed to download')}</li>`).join('');
+      entries.push(`<div class="doc-error-list"><strong>Files that could not be saved</strong><ul style="margin-left:18px; margin-top:6px;">${errors}</ul></div>`);
+    }
+
+    const refs = referenceSectionHtml(referenceEntries);
+    if (refs) entries.push(refs);
+
+    target.innerHTML = entries.join('') || 'No uploaded document details available.';
+  } catch (e) {
+    const refs = referenceSectionHtml(referenceEntries);
+    target.innerHTML = `Could not load saved local documents: ${esc(e.message)}${refs ? '<br><br>' + refs : ''}`;
+  }
+}
 
 
 
@@ -527,7 +642,7 @@ async function loadMicrosoftConfig() {
     auth: {
       clientId: auth.client_id,
       authority: auth.authority,
-      redirectUri: `${window.location.origin}/auth/callback`
+      redirectUri: window.location.origin
     },
     cache: {
       cacheLocation: 'sessionStorage',
@@ -567,6 +682,65 @@ function graphPathEncode(path) {
     .join('/');
 }
 
+function displayDestinationPath(destination) {
+  if (!destination || !destination.configured) return 'No SharePoint destination selected';
+  return [destination.site_name, destination.drive_name, destination.base_folder]
+    .filter(Boolean)
+    .join(' / ');
+}
+
+function renderDestinationSummary(destination) {
+  const el = document.getElementById('sharepoint-destination-summary');
+  if (!el) return;
+
+  if (!destination || !destination.configured) {
+    el.innerHTML = '<strong>SharePoint destination:</strong> Not selected yet<br>Select a site, document library and base folder below.';
+    return;
+  }
+
+  const siteLink = destination.site_url
+    ? `<a href="${esc(destination.site_url)}" target="_blank" rel="noreferrer">${esc(destination.site_name || 'Selected site')}</a>`
+    : esc(destination.site_name || 'Selected site');
+  const driveLink = destination.drive_url
+    ? `<a href="${esc(destination.drive_url)}" target="_blank" rel="noreferrer">${esc(destination.drive_name || 'Selected library')}</a>`
+    : esc(destination.drive_name || 'Selected library');
+
+  el.innerHTML = `
+    <strong>Current SharePoint destination</strong><br>
+    Site: ${siteLink}<br>
+    Document library: ${driveLink}<br>
+    Base folder: ${esc(destination.base_folder || 'Root of library')}<br>
+    Path: ${esc(displayDestinationPath(destination))}
+  `;
+}
+
+async function loadSharePointDestination(force = false) {
+  if (sharePointDestination && !force) return sharePointDestination;
+
+  sharePointDestination = await apiFetch('/sharepoint-destination');
+
+  if (sharePointDestination.configured) {
+    selectedSharePointSite = {
+      id: sharePointDestination.site_id,
+      displayName: sharePointDestination.site_name,
+      webUrl: sharePointDestination.site_url
+    };
+    selectedSharePointDrive = {
+      id: sharePointDestination.drive_id,
+      name: sharePointDestination.drive_name,
+      webUrl: sharePointDestination.drive_url
+    };
+  }
+
+  const folderInput = document.getElementById('sharepoint-base-folder');
+  if (folderInput && !folderInput.value) {
+    folderInput.value = sharePointDestination.base_folder || microsoftConfig?.graph?.default_base_folder || 'HR Demo Candidate Log';
+  }
+
+  renderDestinationSummary(sharePointDestination);
+  return sharePointDestination;
+}
+
 async function loadMicrosoftIntegrationStatus() {
   const statusEl = document.getElementById('integration-status');
   const configEl = document.getElementById('integration-config-summary');
@@ -576,19 +750,19 @@ async function loadMicrosoftIntegrationStatus() {
 
   try {
     const config = await loadMicrosoftConfig();
+    const destination = await loadSharePointDestination(true);
     const account = getSignedInMicrosoftAccount();
-    const graph = config.graph || {};
 
     if (configEl) {
       configEl.innerHTML = `
         <strong>Mode:</strong> Pure SPA + PKCE<br>
-        <strong>SharePoint drive:</strong> ${esc(graph.drive_id || 'Not configured')}<br>
-        <strong>Base folder:</strong> ${esc(graph.base_folder || 'Root of drive')}
+        <strong>SharePoint destination:</strong> ${esc(displayDestinationPath(destination))}<br>
+        <strong>Note:</strong> The site and document library IDs are used internally for Graph calls, but the page shows friendly names only.
       `;
     }
 
     if (!config.configured) {
-      statusEl.innerHTML = '<strong>Backend configuration incomplete</strong><br>Check MS_CLIENT_ID, MS_TENANT_ID and DRIVE_ID in the .env file.';
+      statusEl.innerHTML = '<strong>Backend configuration incomplete</strong><br>Check MS_CLIENT_ID and MS_TENANT_ID in the .env file.';
     } else if (account) {
       statusEl.innerHTML = `<strong>Connected in this browser</strong><br>Signed in as: ${esc(account.username || account.name || 'Unknown user')}`;
     } else {
@@ -685,7 +859,16 @@ async function testMicrosoftGraphConnection() {
 
   try {
     const me = await graphFetch('/me');
-    toast(`Graph connected as ${me.userPrincipalName || me.mail || me.displayName || 'Microsoft user'}`);
+    const destination = await loadSharePointDestination(true);
+
+    if (destination.configured) {
+      await graphFetch(`/sites/${encodeURIComponent(destination.site_id)}`);
+      await graphFetch(`/drives/${encodeURIComponent(destination.drive_id)}`);
+      toast(`Graph connected. Destination reachable: ${displayDestinationPath(destination)}`);
+    } else {
+      toast(`Graph connected as ${me.userPrincipalName || me.mail || me.displayName || 'Microsoft user'}. Select a SharePoint destination next.`);
+    }
+
     await loadMicrosoftIntegrationStatus();
   } catch (e) {
     toast(e.message, true);
@@ -694,24 +877,212 @@ async function testMicrosoftGraphConnection() {
   }
 }
 
+function renderSharePointSiteResults(sites) {
+  const resultsEl = document.getElementById('sharepoint-site-results');
+  if (!resultsEl) return;
+
+  if (!sites.length) {
+    resultsEl.style.display = 'block';
+    resultsEl.innerHTML = 'No SharePoint sites found. Try a different search term.';
+    return;
+  }
+
+  resultsEl.style.display = 'block';
+  resultsEl.innerHTML = '<strong>Search results</strong><br>' + sites.map((site, index) => `
+    <button class="btn btn-ghost" style="margin:8px 8px 0 0;" onclick='selectSharePointSite(${JSON.stringify(site).replace(/'/g, "&#39;")})'>
+      ${esc(site.displayName || site.name || site.webUrl || `Site ${index + 1}`)}
+    </button>
+  `).join('');
+}
+
+async function searchSharePointSites() {
+  const query = document.getElementById('sharepoint-site-search')?.value.trim();
+  const btn = document.getElementById('search-sites-btn');
+
+  if (!query) {
+    toast('Enter a SharePoint site name to search.', true);
+    return;
+  }
+
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Searching…'; }
+
+  try {
+    await loadMicrosoftConfig();
+    const result = await graphFetch(`/sites?search=${encodeURIComponent(query)}`);
+    renderSharePointSiteResults(result.value || []);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = 'Search sites'; }
+  }
+}
+
+async function selectSharePointSite(site) {
+  selectedSharePointSite = site;
+  selectedSharePointDrive = null;
+
+  const driveEl = document.getElementById('sharepoint-drive-results');
+  if (driveEl) {
+    driveEl.innerHTML = `<strong>Selected site:</strong> ${esc(site.displayName || site.name || site.webUrl || 'SharePoint site')}<br>Loading document libraries…`;
+  }
+
+  try {
+    const result = await graphFetch(`/sites/${encodeURIComponent(site.id)}/drives`);
+    renderSharePointDriveResults(result.value || []);
+  } catch (e) {
+    if (driveEl) driveEl.innerHTML = `Could not load document libraries: ${esc(e.message)}`;
+    toast(e.message, true);
+  }
+}
+
+function renderSharePointDriveResults(drives) {
+  const driveEl = document.getElementById('sharepoint-drive-results');
+  if (!driveEl) return;
+
+  if (!drives.length) {
+    driveEl.innerHTML = 'No document libraries found for this site.';
+    return;
+  }
+
+  driveEl.innerHTML = '<strong>Select a document library</strong><br>' + drives.map((drive, index) => `
+    <button class="btn btn-ghost" style="margin:8px 8px 0 0;" onclick='selectSharePointDrive(${JSON.stringify(drive).replace(/'/g, "&#39;")})'>
+      ${esc(drive.name || `Document library ${index + 1}`)}
+    </button>
+  `).join('');
+}
+
+function selectSharePointDrive(drive) {
+  selectedSharePointDrive = drive;
+  const driveEl = document.getElementById('sharepoint-drive-results');
+  if (driveEl) {
+    driveEl.innerHTML = `
+      <strong>Selected site:</strong> ${esc(selectedSharePointSite?.displayName || selectedSharePointSite?.name || 'Selected site')}<br>
+      <strong>Selected document library:</strong> ${esc(drive.name || 'Selected library')}
+    `;
+  }
+}
+
+async function saveSharePointDestination() {
+  const btn = document.getElementById('save-destination-btn');
+  const existing = await loadSharePointDestination(true);
+  const site = selectedSharePointSite || (existing.configured ? {
+    id: existing.site_id,
+    displayName: existing.site_name,
+    webUrl: existing.site_url
+  } : null);
+  const drive = selectedSharePointDrive || (existing.configured ? {
+    id: existing.drive_id,
+    name: existing.drive_name,
+    webUrl: existing.drive_url
+  } : null);
+  const baseFolder = document.getElementById('sharepoint-base-folder')?.value.trim() || existing.base_folder || 'HR Demo Candidate Log';
+
+  if (!site || !site.id) {
+    toast('Select a SharePoint site first.', true);
+    return;
+  }
+  if (!drive || !drive.id) {
+    toast('Select a document library first.', true);
+    return;
+  }
+
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Saving…'; }
+
+  try {
+    const saved = await apiFetch('/sharepoint-destination', {
+      method: 'POST',
+      body: JSON.stringify({
+        site_id: site.id,
+        site_name: site.displayName || site.name || '',
+        site_url: site.webUrl || '',
+        drive_id: drive.id,
+        drive_name: drive.name || '',
+        drive_url: drive.webUrl || '',
+        base_folder: baseFolder
+      })
+    });
+
+    sharePointDestination = null;
+    await loadSharePointDestination(true);
+    await loadMicrosoftIntegrationStatus();
+    toast(`SharePoint destination saved: ${saved.display_path || baseFolder}`);
+    await autoSyncPendingSharePoint('destination saved');
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = 'Save SharePoint destination'; }
+  }
+}
+
+async function getSharePointDestinationForSync() {
+  const destination = await loadSharePointDestination(true);
+  if (!destination.configured || !destination.drive_id) {
+    throw new Error('No SharePoint destination has been selected. Open the Integration tab and choose a site, document library and base folder first.');
+  }
+  return destination;
+}
+
+async function ensureDriveFolderPath(driveId, folderPath, options = {}) {
+  const parts = String(folderPath || '').split('/').map(p => p.trim()).filter(Boolean);
+  if (!parts.length) return null;
+
+  let currentPath = '';
+  let currentFolder = null;
+
+  for (const part of parts) {
+    const parentPath = currentPath;
+    currentPath = [currentPath, part].filter(Boolean).join('/');
+    const encodedCurrentPath = graphPathEncode(currentPath);
+
+    try {
+      currentFolder = await graphFetch(`/drives/${encodeURIComponent(driveId)}/root:/${encodedCurrentPath}`, options);
+      continue;
+    } catch (e) {
+      // Folder does not exist or cannot be found. Try to create it below.
+    }
+
+    const createPath = parentPath
+      ? `/drives/${encodeURIComponent(driveId)}/root:/${graphPathEncode(parentPath)}:/children`
+      : `/drives/${encodeURIComponent(driveId)}/root/children`;
+
+    currentFolder = await graphFetch(createPath, {
+      method: 'POST',
+      contentType: 'application/json',
+      interactive: options.interactive !== false,
+      body: JSON.stringify({
+        name: part,
+        folder: {},
+        '@microsoft.graph.conflictBehavior': 'fail'
+      })
+    });
+  }
+
+  return currentFolder;
+}
+
 async function ensureSharePointCandidateFolder(folderName, options = {}) {
-  const config = await loadMicrosoftConfig();
-  const driveId = config.graph.drive_id;
-  const baseFolder = config.graph.base_folder || '';
+  const destination = await getSharePointDestinationForSync();
+  const driveId = destination.drive_id;
+  const baseFolder = destination.base_folder || '';
   const folderPath = [baseFolder, folderName].filter(Boolean).join('/');
   const encodedFolderPath = graphPathEncode(folderPath);
   const graphOptions = { interactive: options.interactive !== false };
 
-  // Reuse the folder if it already exists.
+  // Ensure the selected base folder exists first.
+  if (baseFolder) {
+    await ensureDriveFolderPath(driveId, baseFolder, graphOptions);
+  }
+
+  // Reuse the candidate folder if it already exists.
   try {
-    return await graphFetch(`/drives/${driveId}/root:/${encodedFolderPath}`, graphOptions);
+    return await graphFetch(`/drives/${encodeURIComponent(driveId)}/root:/${encodedFolderPath}`, graphOptions);
   } catch (e) {
     // Continue and try to create it.
   }
 
   const createPath = baseFolder
-    ? `/drives/${driveId}/root:/${graphPathEncode(baseFolder)}:/children`
-    : `/drives/${driveId}/root/children`;
+    ? `/drives/${encodeURIComponent(driveId)}/root:/${graphPathEncode(baseFolder)}:/children`
+    : `/drives/${encodeURIComponent(driveId)}/root/children`;
 
   try {
     return await graphFetch(createPath, {
@@ -726,13 +1097,13 @@ async function ensureSharePointCandidateFolder(folderName, options = {}) {
     });
   } catch (e) {
     // If another sync created it between the GET and POST, fetch it again.
-    return await graphFetch(`/drives/${driveId}/root:/${encodedFolderPath}`, graphOptions);
+    return await graphFetch(`/drives/${encodeURIComponent(driveId)}/root:/${encodedFolderPath}`, graphOptions);
   }
 }
 
 async function uploadLocalFileToSharePoint(folderId, fileInfo, options = {}) {
-  const config = await loadMicrosoftConfig();
-  const driveId = config.graph.drive_id;
+  const destination = await getSharePointDestinationForSync();
+  const driveId = destination.drive_id;
 
   const localResponse = await fetch(fileInfo.download_url);
   if (!localResponse.ok) {
@@ -742,7 +1113,7 @@ async function uploadLocalFileToSharePoint(folderId, fileInfo, options = {}) {
   const blob = await localResponse.blob();
   const filename = encodeURIComponent(fileInfo.filename);
 
-  return graphFetch(`/drives/${driveId}/items/${folderId}:/${filename}:/content`, {
+  return graphFetch(`/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(folderId)}:/${filename}:/content`, {
     method: 'PUT',
     contentType: 'application/octet-stream',
     interactive: options.interactive !== false,
@@ -751,6 +1122,7 @@ async function uploadLocalFileToSharePoint(folderId, fileInfo, options = {}) {
 }
 
 async function syncCandidateToSharePoint(candidateId, options = {}) {
+  const destination = await getSharePointDestinationForSync();
   const localInfo = await apiFetch(`/candidates/${candidateId}/local-files`);
 
   if (!localInfo.folder_exists || !localInfo.files.length) {
@@ -758,21 +1130,43 @@ async function syncCandidateToSharePoint(candidateId, options = {}) {
   }
 
   const folder = await ensureSharePointCandidateFolder(localInfo.folder_name, options);
+  const folderPath = [destination.base_folder, localInfo.folder_name].filter(Boolean).join('/');
+
+  const uploadedFiles = [];
+  const failedFiles = [];
 
   for (const fileInfo of localInfo.files) {
-    await uploadLocalFileToSharePoint(folder.id, fileInfo, options);
+    try {
+      await uploadLocalFileToSharePoint(folder.id, fileInfo, options);
+      uploadedFiles.push(fileInfo.filename);
+    } catch (error) {
+      console.error(`[SHAREPOINT SYNC] Failed to upload ${fileInfo.filename}:`, error);
+      failedFiles.push({
+        filename: fileInfo.filename,
+        error: error.message || String(error)
+      });
+    }
   }
 
-  const folderPath = [localInfo.base_folder, localInfo.folder_name].filter(Boolean).join('/');
+  const status = failedFiles.length
+    ? `Partially synced - ${failedFiles.length} file(s) failed`
+    : 'Synced';
+
   await apiFetch(`/candidates/${candidateId}/sharepoint-sync`, {
     method: 'POST',
     body: JSON.stringify({
       folder_id: folder.id,
       folder_url: folder.webUrl,
       folder_path: folderPath,
-      status: 'Synced'
+      status
     })
   });
+
+  if (failedFiles.length) {
+    throw new Error(
+      `SharePoint folder was created, but ${failedFiles.length} file(s) failed to upload.`
+    );
+  }
 }
 
 async function syncPendingSharePoint(options = {}) {
@@ -786,6 +1180,8 @@ async function syncPendingSharePoint(options = {}) {
   }
 
   try {
+    await getSharePointDestinationForSync();
+
     // Always check all candidates, not only the current filtered/searched view.
     const allCandidates = await apiFetch('/candidates');
     const pending = allCandidates.filter(c => !c.sharepoint_folder_url);
@@ -1096,32 +1492,17 @@ function openDetail(id) {
     c.car_registration ? `Car registration: ${esc(c.car_registration)}` : null,
   ].filter(Boolean).join('<br>') || 'No contact details available.';
 
-  const documentEntries = [
-    docEntry('NDIS worker check', c.ndis_worker_check),
-    docEntry('Police check', c.police_check),
-    docEntry('Working with children', c.working_with_children),
-    docEntry('100 points ID', c.id_100_points),
-    docEntry('First aid / CPR', c.first_aid_cpr),
-    docEntry('NDIS orientation', c.ndis_orientation),
-    docEntry('COVID training', c.covid_training),
-    docEntry('Car insurance', c.car_insurance),
-    docEntry('Car registration proof', c.car_rego_proof),
-    docEntry('Face ID picture', c.face_id_picture),
-    docEntry('Certificates / study', c.certificates_study),
-    docEntry('Signature', c.signature),
-  ].filter(Boolean);
-
   const formatRef = (refStr) => {
     if (!refStr) return '';
     try {
       const ref = JSON.parse(refStr);
       const lines = [];
       if (ref.name) lines.push(`Name: ${esc(ref.name)}`);
-      if (ref.phone) lines.push(`Phone:${esc(ref.phone)}`);
+      if (ref.phone) lines.push(`Phone: ${esc(ref.phone)}`);
       if (ref.email) lines.push(`Email: ${esc(ref.email)}`);
       return lines.length ? `<div>${lines.join('<br>')}</div>` : '';
     } catch (e) {
-      return `<div>${esc(refStr)}</div>`; // Fallback for old format
+      return `<div>${esc(refStr)}</div>`;
     }
   };
 
@@ -1130,12 +1511,7 @@ function openDetail(id) {
     formatRef(c.reference_2)
   ].filter(Boolean);
 
-  if (referenceEntries.length) {
-    documentEntries.push('<div style="margin-top:14px; font-weight:600;">References</div>');
-    documentEntries.push(referenceEntries.join('<br><br>'));
-  }
-
-  document.getElementById('dp-documents').innerHTML = documentEntries.join('<br>') || 'No uploaded document details available.';
+  renderCandidateSavedDocuments(c, referenceEntries);
   document.getElementById('dp-date').textContent = formatDate(c.date);
   document.getElementById('dp-stage-badge').innerHTML = `<span class="stage-badge ${stageBadgeClass(c.stage)}">${esc(c.stage)}</span>`;
   const curIdx = STAGES.indexOf(c.stage);

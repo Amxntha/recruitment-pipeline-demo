@@ -12,6 +12,7 @@
 import ast
 import base64
 import json
+import mimetypes
 import os
 import re
 import sqlite3
@@ -19,7 +20,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Optional
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -44,10 +45,15 @@ MS_TENANT_ID = os.getenv("MS_TENANT_ID", os.getenv("TENANT_ID", "")).strip()
 GRAPH_SCOPES = ["User.Read", "Sites.ReadWrite.All"]
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 
-# SharePoint destination. The browser uses these values when syncing files.
-SITE_ID = os.getenv("SITE_ID", "").strip()
-DRIVE_ID = os.getenv("DRIVE_ID", "").strip()
-BASE_FOLDER = os.getenv("BASE_FOLDER", "HR Demo Candidate Log").strip().strip("/")
+# Default SharePoint folder suggestion only. The actual SharePoint site and
+# document library are selected by the user in the Integration tab and stored
+# in SQLite, not hardcoded in .env.
+DEFAULT_BASE_FOLDER = os.getenv("DEFAULT_BASE_FOLDER", "HR Demo Candidate Log").strip().strip("/")
+
+# Optional JotForm API fallback. This is used only when the webhook file URL
+# returns HTML instead of real file bytes. The API key stays server-side.
+JOTFORM_API_KEY = os.getenv("JOTFORM_API_KEY", "").strip()
+JOTFORM_API_BASE = os.getenv("JOTFORM_API_BASE", "https://api.jotform.com").rstrip("/")
 
 app = FastAPI(title="HelpAtHandSupport API")
 
@@ -119,6 +125,40 @@ DOCUMENT_UPLOAD_FIELDS = {
     "certificates_study": "certificatesOf",
     "signature": "q8_iConfirm",
 }
+
+DOCUMENT_DISPLAY_LABELS = {
+    "ndis_worker_check": "NDIS worker check",
+    "police_check": "Police check",
+    "working_with_children": "Working with children",
+    "id_100_points": "100 points ID",
+    "first_aid_cpr": "First aid / CPR",
+    "ndis_orientation": "NDIS orientation",
+    "covid_training": "COVID training",
+    "car_insurance": "Car insurance",
+    "car_rego_proof": "Car registration proof",
+    "face_id_picture": "Face ID picture",
+    "certificates_study": "Certificates / study",
+    "signature": "Signature",
+}
+
+PREVIEWABLE_CONTENT_TYPES = {
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/svg+xml",
+    "application/pdf",
+    "text/plain",
+}
+
+
+class FileDownloadError(ValueError):
+    """Raised when a source URL does not return usable file bytes."""
+
+    def __init__(self, message: str, *, returned_html: bool = False):
+        super().__init__(message)
+        self.returned_html = returned_html
+
 
 INTEGRATION_ID = "default"
 
@@ -214,6 +254,20 @@ def init_db() -> None:
             )
         """)
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sharepoint_destination (
+                id TEXT PRIMARY KEY,
+                site_id TEXT NOT NULL,
+                site_name TEXT,
+                site_url TEXT,
+                drive_id TEXT NOT NULL,
+                drive_name TEXT,
+                drive_url TEXT,
+                base_folder TEXT,
+                selected_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
 # ───────────────────────────────────────────────────────────────────────────────
 # PYDANTIC MODELS
 # ───────────────────────────────────────────────────────────────────────────────
@@ -265,17 +319,54 @@ class SharePointSyncIn(BaseModel):
     folder_path: Optional[str] = None
     status: Optional[str] = "Synced"
 
+
+class SharePointDestinationIn(BaseModel):
+    """SharePoint destination selected by the user from the Integration tab."""
+    site_id: str
+    site_name: Optional[str] = ""
+    site_url: Optional[str] = ""
+    drive_id: str
+    drive_name: Optional[str] = ""
+    drive_url: Optional[str] = ""
+    base_folder: Optional[str] = ""
+
 # ───────────────────────────────────────────────────────────────────────────────
 # PURE SPA / MICROSOFT GRAPH CONFIGURATION
 # ───────────────────────────────────────────────────────────────────────────────
 
+def get_sharepoint_destination() -> Optional[dict]:
+    """Return the saved SharePoint site/library/folder destination, if selected."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM sharepoint_destination WHERE id = ?",
+            (INTEGRATION_ID,),
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def destination_display_path(destination: Optional[dict]) -> str:
+    """Return a user-friendly path without exposing Graph IDs in the UI."""
+    if not destination:
+        return ""
+    parts = [
+        destination.get("site_name") or "Selected site",
+        destination.get("drive_name") or "Selected library",
+    ]
+    base_folder = (destination.get("base_folder") or "").strip().strip("/")
+    if base_folder:
+        parts.append(base_folder)
+    return " / ".join(parts)
+
+
 @app.get("/api/spa-config")
 def spa_config():
-    """Return public Microsoft/SharePoint config for the browser SPA.
+    """Return public Microsoft config for the browser SPA.
 
     There is intentionally no client secret here. The frontend uses MSAL.js with
-    PKCE and calls Microsoft Graph directly from the browser.
+    PKCE and calls Microsoft Graph directly from the browser. The SharePoint
+    drive is selected from the Integration tab and stored separately.
     """
+    destination = get_sharepoint_destination()
     return {
         "mode": "pure_spa_pkce",
         "auth": {
@@ -286,11 +377,109 @@ def spa_config():
         "graph": {
             "base_url": GRAPH_BASE_URL,
             "scopes": GRAPH_SCOPES,
-            "site_id": SITE_ID,
-            "drive_id": DRIVE_ID,
-            "base_folder": BASE_FOLDER,
+            "default_base_folder": DEFAULT_BASE_FOLDER,
         },
-        "configured": bool(MS_CLIENT_ID and MS_TENANT_ID and DRIVE_ID),
+        "destination": {
+            "configured": bool(destination),
+            "site_name": destination.get("site_name", "") if destination else "",
+            "site_url": destination.get("site_url", "") if destination else "",
+            "drive_name": destination.get("drive_name", "") if destination else "",
+            "drive_url": destination.get("drive_url", "") if destination else "",
+            "base_folder": destination.get("base_folder", "") if destination else "",
+            "display_path": destination_display_path(destination),
+        },
+        "configured": bool(MS_CLIENT_ID and MS_TENANT_ID),
+    }
+
+
+@app.get("/api/sharepoint-destination")
+def read_sharepoint_destination():
+    """Return the saved SharePoint destination. IDs are returned for browser Graph calls,
+    but the frontend displays only the friendly site/library/folder path.
+    """
+    
+    destination = get_sharepoint_destination()
+    if not destination:
+    
+        return {
+            "configured": False,
+            "site_id": "",
+            "site_name": "",
+            "site_url": "",
+            "drive_id": "",
+            "drive_name": "",
+            "drive_url": "",
+            "base_folder": DEFAULT_BASE_FOLDER,
+            "display_path": "",
+        }
+    
+    
+    return {
+        "configured": True,
+        "site_id": destination.get("site_id") or "",
+        "site_name": destination.get("site_name") or "",
+        "site_url": destination.get("site_url") or "",
+        "drive_id": destination.get("drive_id") or "",
+        "drive_name": destination.get("drive_name") or "",
+        "drive_url": destination.get("drive_url") or "",
+        "base_folder": destination.get("base_folder") or "",
+        "display_path": destination_display_path(destination),
+        "selected_at": destination.get("selected_at") or "",
+    }
+
+
+@app.post("/api/sharepoint-destination")
+def save_sharepoint_destination(data: SharePointDestinationIn):
+    """Save the SharePoint site, document library and base folder selected by the user."""
+    site_id = data.site_id.strip()
+    drive_id = data.drive_id.strip()
+    base_folder = (data.base_folder or "").strip().strip("/")
+
+    if not site_id:
+        raise HTTPException(400, "SharePoint site is required")
+    if not drive_id:
+        raise HTTPException(400, "SharePoint document library is required")
+
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO sharepoint_destination (
+                id, site_id, site_name, site_url, drive_id, drive_name, drive_url, base_folder, selected_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(id) DO UPDATE SET
+                site_id = excluded.site_id,
+                site_name = excluded.site_name,
+                site_url = excluded.site_url,
+                drive_id = excluded.drive_id,
+                drive_name = excluded.drive_name,
+                drive_url = excluded.drive_url,
+                base_folder = excluded.base_folder,
+                selected_at = datetime('now')
+            """,
+            (
+                INTEGRATION_ID,
+                site_id,
+                (data.site_name or "").strip(),
+                (data.site_url or "").strip(),
+                drive_id,
+                (data.drive_name or "").strip(),
+                (data.drive_url or "").strip(),
+                base_folder,
+            ),
+        )
+
+    destination = get_sharepoint_destination()
+  
+    return {
+        "message": "SharePoint destination saved.",
+        "configured": True,
+        "site_name": destination.get("site_name") or "",
+        "site_url": destination.get("site_url") or "",
+        "drive_name": destination.get("drive_name") or "",
+        "drive_url": destination.get("drive_url") or "",
+        "base_folder": destination.get("base_folder") or "",
+        "display_path": destination_display_path(destination),
     }
 
 
@@ -301,14 +490,22 @@ def microsoft_integration_status():
     In pure SPA mode, connection status is checked in the browser because the
     browser owns the Microsoft account session and token cache.
     """
+    destination = get_sharepoint_destination()
     return {
         "mode": "pure_spa_pkce",
-        "configured": bool(MS_CLIENT_ID and MS_TENANT_ID and DRIVE_ID),
+        "configured": bool(MS_CLIENT_ID and MS_TENANT_ID),
+        "destination_configured": bool(destination),
         "connected": False,
         "client_id": MS_CLIENT_ID,
         "tenant_id": MS_TENANT_ID,
-        "drive_id": DRIVE_ID,
-        "base_folder": BASE_FOLDER,
+        "destination": {
+            "site_name": destination.get("site_name", "") if destination else "",
+            "site_url": destination.get("site_url", "") if destination else "",
+            "drive_name": destination.get("drive_name", "") if destination else "",
+            "drive_url": destination.get("drive_url", "") if destination else "",
+            "base_folder": destination.get("base_folder", "") if destination else "",
+            "display_path": destination_display_path(destination),
+        },
         "message": "Microsoft sign-in and Graph API calls are handled by the browser using MSAL.js and PKCE.",
     }
 
@@ -549,55 +746,479 @@ def sanitize_filename(name: str) -> str:
     return cleaned or "submission"
 
 
-def download_bytes_from_url(url: str) -> bytes:
-    """Download a file from a JotForm URL or decode a base64 data URL."""
-    if not url:
-        raise ValueError("No URL supplied")
 
-    if url.startswith("data:"):
-        _header, encoded = url.split(",", 1)
-        encoded += "=" * ((-len(encoded)) % 4)
-        return base64.b64decode(encoded, validate=False)
+def jotform_api_get(path: str, params: Optional[dict] = None) -> dict:
+    """Call the JotForm API using the server-side API key.
 
-    response = requests.get(url, timeout=60, stream=True)
+    The API is used as a fallback source of submission/file metadata when the
+    direct file URL from the webhook returns HTML instead of file bytes.
+    """
+    if not JOTFORM_API_KEY:
+        raise FileDownloadError(
+            "JotForm API fallback is unavailable because JOTFORM_API_KEY is not configured."
+        )
+
+    api_path = path if path.startswith("/") else f"/{path}"
+    response = requests.get(
+        f"{JOTFORM_API_BASE}{api_path}",
+        params=params or {},
+        timeout=90,
+        headers={
+            "APIKEY": JOTFORM_API_KEY,
+            "Accept": "application/json",
+            "User-Agent": "HelpAtHandSupport-RecruitmentPipeline/1.0",
+        },
+    )
     response.raise_for_status()
-    return response.content
+    return response.json()
 
 
-def get_file_extension(url: str) -> str:
-    """Infer a suitable file extension from a URL or data URL."""
+def extract_urls_from_any(value: Any) -> list[str]:
+    """Recursively collect HTTP/HTTPS URLs from strings, lists and dicts."""
+    urls: list[str] = []
+
+    if value is None:
+        return urls
+
+    if isinstance(value, str):
+        urls.extend(re.findall(r"https?://[^\s'\"<>\]]+", value))
+        return urls
+
+    if isinstance(value, list):
+        for item in value:
+            urls.extend(extract_urls_from_any(item))
+        return urls
+
+    if isinstance(value, dict):
+        for item in value.values():
+            urls.extend(extract_urls_from_any(item))
+        return urls
+
+    return urls
+
+
+def normalise_jotform_field_name(name: str) -> str:
+    """Normalise q-numbered JotForm keys for safer comparison."""
+    value = str(name or "").strip().lower()
+    value = re.sub(r"^q\d+_", "", value)
+    value = re.sub(r"[^a-z0-9]+", "", value)
+    return value
+
+
+def unique_urls(urls: list[str]) -> list[str]:
+    """Return URLs in original order without duplicates."""
+    seen = set()
+    cleaned = []
+    for url in urls:
+        candidate = (url or "").strip().rstrip(',.;)\"]}')
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            cleaned.append(candidate)
+    return cleaned
+
+
+def get_jotform_submission_file_urls(submission_id: Optional[str], document_key: str) -> list[str]:
+    """Find field-specific uploaded file URLs from the JotForm submission API."""
+    if not submission_id:
+        return []
+
+    payload = jotform_api_get(f"/submission/{submission_id}")
+    content = payload.get("content", payload) if isinstance(payload, dict) else {}
+    answers = content.get("answers", {}) if isinstance(content, dict) else {}
+
+    if not isinstance(answers, dict):
+        return []
+
+    expected_field = DOCUMENT_UPLOAD_FIELDS.get(document_key, "")
+    expected_norm = normalise_jotform_field_name(expected_field)
+    matches: list[str] = []
+
+    for answer in answers.values():
+        if not isinstance(answer, dict):
+            continue
+
+        answer_name = answer.get("name", "")
+        answer_text = answer.get("text", "")
+        answer_norm = normalise_jotform_field_name(answer_name)
+        text_norm = normalise_jotform_field_name(answer_text)
+
+        # Prefer exact field-name matches so the fallback does not attach the
+        # wrong applicant document to the wrong candidate field.
+        if expected_norm and expected_norm in {answer_norm, text_norm}:
+            matches.extend(extract_urls_from_any(answer))
+
+    return unique_urls(matches)
+
+
+def document_match_tokens(document_key: str) -> set[str]:
+    """Build a small token set for cautious matching in /form/{id}/files fallback."""
+    label = DOCUMENT_DISPLAY_LABELS.get(document_key, document_key)
+    raw = f"{document_key} {DOCUMENT_UPLOAD_FIELDS.get(document_key, '')} {label}".lower()
+    tokens = set(re.findall(r"[a-z0-9]+", raw))
+    stop_words = {"file", "upload", "proof", "document", "documents", "of", "and", "the", "id"}
+    return {token for token in tokens if len(token) >= 3 and token not in stop_words}
+
+
+def get_jotform_form_file_urls(form_id: Optional[str], document_key: str) -> list[str]:
+    """Fallback to /form/{id}/files and cautiously keep URLs that look relevant."""
+    if not form_id:
+        return []
+
+    payload = jotform_api_get(f"/form/{form_id}/files")
+    content = payload.get("content", payload) if isinstance(payload, dict) else payload
+    urls = unique_urls(extract_urls_from_any(content))
+    if not urls:
+        return []
+
+    tokens = document_match_tokens(document_key)
+    if not tokens:
+        return []
+
+    matched: list[str] = []
+    for url in urls:
+        lower_url = unquote(urlparse(url).path + " " + urlparse(url).query).lower()
+        if any(token in lower_url for token in tokens):
+            matched.append(url)
+
+    return unique_urls(matched)
+
+
+def get_jotform_api_fallback_urls(
+    document_key: str,
+    *,
+    form_id: Optional[str],
+    submission_id: Optional[str],
+    primary_url: Optional[str] = None,
+) -> list[str]:
+    """Return possible replacement URLs from JotForm API metadata."""
+    urls: list[str] = []
+
+    # Best fallback: field-specific URL from this exact submission.
+    urls.extend(get_jotform_submission_file_urls(submission_id, document_key))
+
+    # Secondary fallback: form-level file list with cautious filename matching.
+    # This is intentionally conservative to avoid attaching the wrong document.
+    urls.extend(get_jotform_form_file_urls(form_id, document_key))
+
+    cleaned = unique_urls(urls)
+    if primary_url:
+        cleaned = [url for url in cleaned if url != primary_url]
+    return cleaned
+
+
+def download_document_with_jotform_fallback(
+    *,
+    document_key: str,
+    primary_url: str,
+    label: str,
+    jotform_context: Optional[dict] = None,
+) -> dict:
+    """Download from webhook URL first, then try JotForm API metadata on HTML.
+
+    Flow:
+    1. Try the URL provided in the webhook/rawRequest.
+    2. If that URL returns HTML, ask JotForm API for field-specific file URLs.
+    3. If API URLs also return HTML/invalid bytes, surface a clear error.
+    """
+    context = jotform_context or {}
+
+    try:
+        downloaded = download_validated_file_from_url(primary_url, label)
+        downloaded["download_source"] = "webhook_url"
+        downloaded["source_url"] = primary_url
+        return downloaded
+    except FileDownloadError as primary_error:
+        if not primary_error.returned_html:
+            raise
+
+        form_id = context.get("form_id")
+        submission_id = context.get("submission_id")
+        fallback_attempt_errors = [f"Webhook URL: {primary_error}"]
+
+        if not JOTFORM_API_KEY:
+            raise FileDownloadError(
+                f"{label} webhook URL returned HTML. JotForm API fallback cannot run because "
+                "JOTFORM_API_KEY is not configured in the backend .env file.",
+                returned_html=True,
+            )
+
+        fallback_urls = get_jotform_api_fallback_urls(
+            document_key,
+            form_id=form_id,
+            submission_id=submission_id,
+            primary_url=primary_url,
+        )
+
+        if not fallback_urls:
+            raise FileDownloadError(
+                f"{label} webhook URL returned HTML. JotForm API fallback found no matching file URL "
+                f"for this field. Check that JOTFORM_API_KEY is configured and the upload field name matches.",
+                returned_html=True,
+            )
+
+        for index, fallback_url in enumerate(fallback_urls, start=1):
+            try:
+                downloaded = download_validated_file_from_url(
+                    fallback_url,
+                    f"{label} JotForm API fallback {index}",
+                )
+                downloaded["download_source"] = "jotform_api_fallback"
+                downloaded["source_url"] = fallback_url
+                downloaded["primary_error"] = str(primary_error)
+                return downloaded
+            except Exception as fallback_error:
+                fallback_attempt_errors.append(f"Fallback URL {index}: {fallback_error}")
+
+        raise FileDownloadError(
+            f"{label} webhook URL returned HTML. JotForm API fallback was tried, "
+            f"but no valid file bytes were downloaded. Attempts: "
+            + " | ".join(fallback_attempt_errors),
+            returned_html=True,
+        )
+
+def is_html_bytes(file_bytes: bytes) -> bool:
+    """Return True when downloaded bytes look like an HTML page, not a file."""
+    sample = file_bytes[:512].lstrip().lower()
+    return sample.startswith(b"<!doctype") or sample.startswith(b"<html") or b"<html" in sample[:128]
+
+
+def detect_file_type(file_bytes: bytes, header_content_type: str = "") -> dict:
+    """Detect the true file type from bytes, falling back to trusted content type.
+
+    File extensions from URLs are intentionally not trusted because JotForm can
+    return preview pages, redirects or blocked HTML while the URL still appears
+    to end in an image extension.
+    """
+    header_content_type = (header_content_type or "").split(";")[0].strip().lower()
+
+    if file_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return {"extension": ".png", "content_type": "image/png", "detected_type": "PNG image", "previewable": True}
+    if file_bytes.startswith(b"\xff\xd8\xff"):
+        return {"extension": ".jpg", "content_type": "image/jpeg", "detected_type": "JPEG image", "previewable": True}
+    if file_bytes.startswith(b"GIF87a") or file_bytes.startswith(b"GIF89a"):
+        return {"extension": ".gif", "content_type": "image/gif", "detected_type": "GIF image", "previewable": True}
+    if file_bytes.startswith(b"RIFF") and b"WEBP" in file_bytes[:20]:
+        return {"extension": ".webp", "content_type": "image/webp", "detected_type": "WEBP image", "previewable": True}
+    if file_bytes.startswith(b"%PDF"):
+        return {"extension": ".pdf", "content_type": "application/pdf", "detected_type": "PDF document", "previewable": True}
+
+    stripped = file_bytes[:256].lstrip()
+    if stripped.startswith(b"<?xml") or stripped.startswith(b"<svg"):
+        return {"extension": ".svg", "content_type": "image/svg+xml", "detected_type": "SVG image", "previewable": True}
+
+    if header_content_type in PREVIEWABLE_CONTENT_TYPES:
+        extension = mimetypes.guess_extension(header_content_type) or ".bin"
+        if extension == ".jpe":
+            extension = ".jpg"
+        return {
+            "extension": extension,
+            "content_type": header_content_type,
+            "detected_type": f"{header_content_type} file",
+            "previewable": header_content_type.startswith("image/") or header_content_type in {"application/pdf", "text/plain"},
+        }
+
+    return {"extension": ".bin", "content_type": header_content_type or "application/octet-stream", "detected_type": "Unknown binary file", "previewable": False}
+
+
+def download_validated_file_from_url(url: str, document_label: str = "file") -> dict:
+    """Download a JotForm file and validate the response before saving it.
+
+    Returns bytes plus detected metadata. Raises ValueError when the URL returns
+    HTML, empty content, or a clearly invalid response.
+    """
+    if not url:
+        raise FileDownloadError("No URL supplied")
+
     if url.startswith("data:"):
-        return ".jpg" if "image/jpeg" in url else ".png"
-    return os.path.splitext(url.split("?")[0])[1] or ".bin"
+        header, encoded = url.split(",", 1)
+        encoded += "=" * ((-len(encoded)) % 4)
+        file_bytes = base64.b64decode(encoded, validate=False)
+        header_content_type = header.split(";")[0].replace("data:", "").strip().lower()
 
+        if not file_bytes:
+            raise FileDownloadError(f"{document_label} is empty")
+        if is_html_bytes(file_bytes):
+            raise FileDownloadError(f"{document_label} decoded to HTML instead of a file", returned_html=True)
+
+        detected = detect_file_type(file_bytes, header_content_type)
+        return {"bytes": file_bytes, **detected}
+
+    response = requests.get(
+        url,
+        timeout=90,
+        allow_redirects=True,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "image/avif,image/webp,image/apng,image/*,application/pdf,*/*;q=0.8",
+        },
+    )
+
+    if response.status_code != 200:
+        raise FileDownloadError(f"{document_label} download returned HTTP {response.status_code}")
+
+    file_bytes = response.content
+    content_type = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
+
+    if not file_bytes:
+        raise FileDownloadError(f"{document_label} download returned an empty file")
+
+    if "text/html" in content_type or is_html_bytes(file_bytes):
+        raise FileDownloadError(
+            f"{document_label} URL returned HTML instead of file bytes. "
+            "This usually means the JotForm link is a preview page, blocked, expired, or requires access.",
+            returned_html=True,
+        )
+
+    detected = detect_file_type(file_bytes, content_type)
+    if detected["extension"] == ".bin" and not content_type.startswith("application/octet-stream"):
+        print(f"[STORAGE DEBUG] Unknown file type for {document_label}: content_type={content_type}")
+
+    return {"bytes": file_bytes, **detected}
+
+
+def get_media_type_for_file(path: str) -> str:
+    """Return a useful media type for a saved local file."""
+    try:
+        with open(path, "rb") as handle:
+            file_bytes = handle.read(512)
+        return detect_file_type(file_bytes, mimetypes.guess_type(path)[0] or "")["content_type"]
+    except Exception:
+        return mimetypes.guess_type(path)[0] or "application/octet-stream"
 
 def build_submission_summary(full_name: str, fields: dict, document_urls: dict) -> str:
-    """Create the submission_details.txt content."""
+    """Create the submission_details.txt content using expected saved documents and references."""
+
+    def clean_value(value):
+        if value is None:
+            return "N/A"
+
+        if isinstance(value, list):
+            cleaned = [str(v).strip() for v in value if str(v).strip()]
+            return ", ".join(cleaned) if cleaned else "N/A"
+
+        if isinstance(value, dict):
+            cleaned = [f"{k}: {v}" for k, v in value.items() if str(v).strip()]
+            return ", ".join(cleaned) if cleaned else "N/A"
+
+        value = str(value).strip()
+        return value if value else "N/A"
+
+    def get_value(*keys):
+        for key in keys:
+            value = clean_value(fields.get(key))
+            if value != "N/A":
+                return value
+        return "N/A"
+
+    def get_document_value(*keys):
+        for key in keys:
+            value = clean_value(document_urls.get(key))
+            if value != "N/A":
+                return value
+
+        for key in keys:
+            value = clean_value(fields.get(key))
+            if value != "N/A":
+                return value
+
+        return "N/A"
+
+    def get_signature_status():
+        signature_value = get_document_value("signature")
+        return "Provided" if signature_value != "N/A" else "N/A"
+
+    def format_reference(reference_value):
+        if not reference_value:
+            return ["N/A"]
+
+        try:
+            reference = json.loads(reference_value) if isinstance(reference_value, str) else reference_value
+        except Exception:
+            return [clean_value(reference_value)]
+
+        if not isinstance(reference, dict) or not reference:
+            return ["N/A"]
+
+        return [
+            f"Name: {clean_value(reference.get('name'))}",
+            f"Phone: {clean_value(reference.get('phone'))}",
+            f"Email: {clean_value(reference.get('email'))}",
+        ]
+
     summary_lines = [
-        f"Submission for: {fields.get('full_name', full_name) or 'Unknown'}",
-        f"Candidate ID: {fields.get('candidate_id') or 'N/A'}",
-        f"Email: {fields.get('email') or 'N/A'}",
-        f"Mobile: {fields.get('mobile_number') or 'N/A'}",
-        f"State: {fields.get('state') or 'N/A'}",
-        f"Car Registration: {fields.get('car_registration') or 'N/A'}",
-        f"Submission Date: {fields.get('submission_date') or 'N/A'}",
+        "Candidate Submission Summary",
+        "============================",
+        "",
+        "Candidate Details:",
+        f"Candidate name: {get_value('full_name') if get_value('full_name') != 'N/A' else clean_value(full_name)}",
+        f"Candidate ID: {get_value('candidate_id')}",
+        f"Email: {get_value('email')}",
+        f"Mobile: {get_value('mobile_number', 'mobile', 'phone')}",
+        f"State: {get_value('state')}",
+        f"Car Registration: {get_value('car_registration')}",
+        f"Submission Date: {get_value('submission_date')}",
+        f"Form ID: {get_value('form_id')}",
+        f"Submission ID: {get_value('submission_id')}",
+        "",
+        "Reference Information:",
+        "Reference 1:",
+    ]
+
+    for line in format_reference(fields.get("reference_1")):
+        summary_lines.append(f"- {line}")
+
+    summary_lines.append("Reference 2:")
+
+    for line in format_reference(fields.get("reference_2")):
+        summary_lines.append(f"- {line}")
+
+    summary_lines.extend([
         "",
         "Document Links:",
-    ]
-    summary_lines.extend(f"- {key}: {value or 'Not provided'}" for key, value in document_urls.items())
+        f"NDIS worker check: {get_document_value('ndis_worker_check')}",
+        f"Police check: {get_document_value('police_check')}",
+        f"Working with children: {get_document_value('working_with_children')}",
+        f"100 points ID: {get_document_value('id_100_points')}",
+        f"First aid / CPR: {get_document_value('first_aid_cpr')}",
+        f"NDIS orientation: {get_document_value('ndis_orientation')}",
+        f"COVID training: {get_document_value('covid_training')}",
+        f"Car insurance: {get_document_value('car_insurance')}",
+        f"Car registration proof: {get_document_value('car_rego_proof')}",
+        f"Face ID picture: {get_document_value('face_id_picture')}",
+        f"Certificates / study: {get_document_value('certificates_study')}",
+        f"Signature: {get_signature_status()}",
+    ])
+
     return "\n".join(summary_lines) + "\n"
 
 
-def candidate_local_folder(cid: str) -> str:
+def candidate_folder_name(cid: str, full_name: Optional[str] = None) -> str:
+    """Return the folder name used for both local storage and SharePoint."""
+    safe_id = sanitize_filename(cid)
+    safe_name = sanitize_filename(full_name or "")
+
+    if safe_name:
+        return f"{safe_name}_{safe_id}"
+
+    return safe_id
+
+
+def candidate_local_folder(cid: str, full_name: Optional[str] = None) -> str:
     """Return the local storage folder for a candidate."""
-    return os.path.join(STORAGE_ROOT, sanitize_filename(cid))
+    return os.path.join(STORAGE_ROOT, candidate_folder_name(cid, full_name))
 
 
-def save_local_submission_files(local_folder: str, summary_text: str, document_urls: dict) -> dict:
-    """Save submission details and documents to local storage.
+def save_local_submission_files(
+    local_folder: str,
+    summary_text: str,
+    document_urls: dict,
+    jotform_context: Optional[dict] = None,
+) -> dict:
+    """Save submission details and validated documents to local storage.
 
-    This is the main fail-safe in pure SPA mode. The browser can later read
-    these local files through the API and upload them to SharePoint using Graph.
+    The saved local files become the single reliable source used by the site
+    preview and by browser-based SharePoint sync. JotForm URLs are treated only
+    as temporary source links used during webhook processing.
     """
     os.makedirs(local_folder, exist_ok=True)
     info_path = os.path.join(local_folder, "submission_details.txt")
@@ -606,23 +1227,121 @@ def save_local_submission_files(local_folder: str, summary_text: str, document_u
         handle.write(summary_text)
 
     saved_files = ["submission_details.txt"]
-    for name, url in document_urls.items():
+    manifest = [
+        {
+            "document_key": "submission_details",
+            "label": "Submission details",
+            "filename": "submission_details.txt",
+            "content_type": "text/plain",
+            "detected_type": "Text file",
+            "previewable": True,
+            "size_bytes": os.path.getsize(info_path),
+        }
+    ]
+    errors = []
+
+    for document_key, url in document_urls.items():
         if not url:
             continue
+
+        label = DOCUMENT_DISPLAY_LABELS.get(document_key, document_key.replace("_", " ").title())
+
         try:
-            file_path = os.path.join(local_folder, f"{sanitize_filename(name)}{get_file_extension(url)}")
+            downloaded = download_document_with_jotform_fallback(
+                document_key=document_key,
+                primary_url=url,
+                label=label,
+                jotform_context=jotform_context,
+            )
+            extension = downloaded["extension"]
+            filename = f"{sanitize_filename(document_key)}{extension}"
+            file_path = os.path.join(local_folder, filename)
+
             with open(file_path, "wb") as handle:
-                handle.write(download_bytes_from_url(url))
-            saved_files.append(os.path.basename(file_path))
+                handle.write(downloaded["bytes"])
+
+            file_info = {
+                "document_key": document_key,
+                "label": label,
+                "filename": filename,
+                "content_type": downloaded["content_type"],
+                "detected_type": downloaded["detected_type"],
+                "previewable": downloaded["previewable"],
+                "size_bytes": os.path.getsize(file_path),
+                "download_source": downloaded.get("download_source", "webhook_url"),
+            }
+            manifest.append(file_info)
+            saved_files.append(filename)
+            print(f"[STORAGE DEBUG] Saved {label} as {filename} ({downloaded['detected_type']})")
+
         except Exception as exc:
-            print(f"[STORAGE DEBUG] Failed to save local file {name}: {exc}")
+            error = {
+                "document_key": document_key,
+                "label": label,
+                "source_url_present": True,
+                "fallback_attempted": isinstance(exc, FileDownloadError) and exc.returned_html,
+                "error": str(exc),
+            }
+            errors.append(error)
+            print(f"[STORAGE DEBUG] Failed to save local file {label}: {exc}")
 
-    return {"storage_type": "local", "folder": local_folder, "files": saved_files, "details_file": info_path}
+    manifest_path = os.path.join(local_folder, "documents_manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump({"files": manifest, "errors": errors}, handle, indent=2)
+
+    if errors:
+        error_path = os.path.join(local_folder, "download_errors.txt")
+        with open(error_path, "w", encoding="utf-8") as handle:
+            handle.write("Some JotForm files could not be downloaded or validated.\n\n")
+            for error in errors:
+                handle.write(f"- {error['label']}: {error['error']}\n")
+        saved_files.append("download_errors.txt")
+        manifest.append({
+            "document_key": "download_errors",
+            "label": "Download errors",
+            "filename": "download_errors.txt",
+            "content_type": "text/plain",
+            "detected_type": "Text file",
+            "previewable": True,
+            "size_bytes": os.path.getsize(error_path),
+        })
+
+        # Rewrite manifest so it includes the error file entry as well.
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump({"files": manifest, "errors": errors}, handle, indent=2)
+
+    return {
+        "storage_type": "local",
+        "folder": local_folder,
+        "files": saved_files,
+        "details_file": info_path,
+        "manifest_file": manifest_path,
+        "errors": errors,
+    }
 
 
-def save_candidate_submission(cid: str, candidate: CandidateIn, document_urls: dict) -> None:
+def load_local_documents_manifest(local_folder: str) -> dict:
+    """Load local document metadata generated during webhook storage."""
+    manifest_path = os.path.join(local_folder, "documents_manifest.json")
+    if not os.path.isfile(manifest_path):
+        return {"files": [], "errors": []}
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception as exc:
+        print(f"[STORAGE DEBUG] Could not read documents manifest: {exc}")
+        return {"files": [], "errors": []}
+
+
+def save_candidate_submission(
+    cid: str,
+    candidate: CandidateIn,
+    document_urls: dict,
+    jotform_context: Optional[dict] = None,
+) -> None:
     """Save the JotForm submission locally for later browser-based SharePoint sync."""
-    local_folder = candidate_local_folder(cid)
+    local_folder = candidate_local_folder(cid, candidate.name)
+
     summary_text = build_submission_summary(
         candidate.name,
         {
@@ -633,11 +1352,18 @@ def save_candidate_submission(cid: str, candidate: CandidateIn, document_urls: d
             "state": candidate.state,
             "car_registration": candidate.car_registration,
             "submission_date": candidate.date,
+            "reference_1": candidate.reference_1,
+            "reference_2": candidate.reference_2,
+            "form_id": (jotform_context or {}).get("form_id"),
+            "submission_id": (jotform_context or {}).get("submission_id"),
         },
         document_urls,
     )
 
-    storage_result = save_local_submission_files(local_folder, summary_text, document_urls)
+    storage_result = save_local_submission_files(local_folder, summary_text, document_urls, jotform_context)
+    sync_status = "Pending browser sync"
+    if storage_result.get("errors"):
+        sync_status = "Pending browser sync - some files failed validation"
 
     with get_conn() as conn:
         conn.execute(
@@ -646,11 +1372,11 @@ def save_candidate_submission(cid: str, candidate: CandidateIn, document_urls: d
             SET local_folder_path = ?,
                 sharepoint_sync_status = CASE
                     WHEN sharepoint_folder_url IS NOT NULL AND sharepoint_folder_url != '' THEN sharepoint_sync_status
-                    ELSE 'Pending browser sync'
+                    ELSE ?
                 END
             WHERE id = ?
             """,
-            (local_folder, cid),
+            (local_folder, sync_status, cid),
         )
 
     print("[STORAGE DEBUG] Submission files saved locally", storage_result)
@@ -675,13 +1401,17 @@ async def jotform_webhook(request: Request):
 
     if form_id == "261460903084858" or (form_title and "document request" in form_title.lower()):
         print("[WEBHOOK DEBUG] routing to document request processor")
-        return handle_document_request(raw)
+        jotform_context = {
+            "form_id": form_id or raw.get("formID") or raw.get("form_id"),
+            "submission_id": data.get("submissionID") or raw.get("submissionID") or raw.get("submission_id"),
+        }
+        return handle_document_request(raw, jotform_context)
 
     print("[WEBHOOK DEBUG] unsupported JotForm webhook payload")
     raise HTTPException(400, "Unsupported JotForm webhook payload")
 
 
-def handle_document_request(raw: dict):
+def handle_document_request(raw: dict, jotform_context: Optional[dict] = None):
     """Create or update a candidate from a JotForm document request submission."""
     candidate, document_urls = build_candidate_from_jotform(raw)
 
@@ -698,7 +1428,7 @@ def handle_document_request(raw: dict):
 
     cid = result.get("id")
     print(f"[WEBHOOK DEBUG] candidate UUID: {cid}")
-    save_candidate_submission(cid, candidate, document_urls)
+    save_candidate_submission(cid, candidate, document_urls, jotform_context)
 
     with get_conn() as conn:
         refreshed = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
@@ -746,31 +1476,50 @@ def create_candidate(data: CandidateIn):
 
 @app.get("/api/candidates/{cid}/local-files")
 def list_candidate_local_files(cid: str):
-    """List locally saved files for a candidate so the browser can sync them to SharePoint."""
+    """List locally saved files for preview and browser SharePoint sync."""
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
 
     if not row:
         raise HTTPException(404, "Candidate not found")
+  
 
     candidate = row_to_dict(row)
-    local_folder = candidate.get("local_folder_path") or candidate_local_folder(cid)
+    folder_name = candidate_folder_name(cid, candidate.get("name"))
+    local_folder = candidate.get("local_folder_path") or candidate_local_folder(cid, candidate.get("name"))
     if not os.path.isdir(local_folder):
         return {
             "candidate_id": cid,
-            "folder_name": sanitize_filename(cid),
+            "folder_name": os.path.basename(local_folder.rstrip("/\\")) or folder_name,
             "folder_exists": False,
             "files": [],
+            "errors": [],
             "message": "No local files were found for this candidate.",
         }
 
+
+    manifest = load_local_documents_manifest(local_folder)
+    manifest_files = manifest.get("files") or []
+    manifest_by_name = {item.get("filename"): item for item in manifest_files if item.get("filename")}
+
     files = []
     for filename in sorted(os.listdir(local_folder)):
+        if filename == "documents_manifest.json":
+            continue
+
         file_path = os.path.join(local_folder, filename)
         if not os.path.isfile(file_path):
             continue
+
+        metadata = manifest_by_name.get(filename, {})
+        content_type = metadata.get("content_type") or get_media_type_for_file(file_path)
         files.append({
             "filename": filename,
+            "label": metadata.get("label") or filename,
+            "document_key": metadata.get("document_key") or os.path.splitext(filename)[0],
+            "content_type": content_type,
+            "detected_type": metadata.get("detected_type") or detect_file_type(open(file_path, "rb").read(512), content_type)["detected_type"],
+            "previewable": bool(metadata.get("previewable", content_type.startswith("image/") or content_type in {"application/pdf", "text/plain"})),
             "size_bytes": os.path.getsize(file_path),
             "download_url": f"/api/candidates/{cid}/files/{quote(filename, safe='')}",
         })
@@ -778,11 +1527,16 @@ def list_candidate_local_files(cid: str):
     return {
         "candidate_id": cid,
         "candidate_name": candidate.get("name") or "",
-        "folder_name": sanitize_filename(cid),
+        "folder_name": os.path.basename(local_folder.rstrip("/\\")) or folder_name,
         "folder_exists": True,
-        "drive_id": DRIVE_ID,
-        "base_folder": BASE_FOLDER,
+        "sharepoint_destination": {
+            "configured": bool(get_sharepoint_destination()),
+            "display_path": destination_display_path(get_sharepoint_destination()),
+        },
+        "sharepoint_sync_status": candidate.get("sharepoint_sync_status") or "",
+        "sharepoint_folder_url": candidate.get("sharepoint_folder_url") or "",
         "files": files,
+        "errors": manifest.get("errors") or [],
     }
 
 
@@ -794,18 +1548,24 @@ def download_candidate_local_file(cid: str, filename: str):
         raise HTTPException(400, "Invalid filename")
 
     with get_conn() as conn:
-        row = conn.execute("SELECT local_folder_path FROM candidates WHERE id = ?", (cid,)).fetchone()
+        row = conn.execute("SELECT name, local_folder_path FROM candidates WHERE id = ?", (cid,)).fetchone()
 
     if not row:
         raise HTTPException(404, "Candidate not found")
 
-    local_folder = row["local_folder_path"] or candidate_local_folder(cid)
+    local_folder = row["local_folder_path"] or candidate_local_folder(cid, row["name"])
     file_path = os.path.join(local_folder, safe_filename)
 
     if not os.path.isfile(file_path):
         raise HTTPException(404, "Local file not found")
 
-    return FileResponse(file_path, filename=safe_filename)
+
+    return FileResponse(
+        file_path,
+        filename=safe_filename,
+        media_type=get_media_type_for_file(file_path),
+        headers={"Content-Disposition": f"inline; filename=\"{safe_filename}\""},
+    )
 
 
 @app.post("/api/candidates/{cid}/sharepoint-sync", response_model=CandidateOut)
@@ -834,7 +1594,7 @@ def update_candidate_sharepoint_sync(cid: str, data: SharePointSyncIn):
             ),
         )
         row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
-
+  
     return row_to_dict(row)
 
 
@@ -890,6 +1650,41 @@ def stats():
         "active": active,
         "by_stage": {row["stage"]: row["n"] for row in by_stage},
     }
+
+@app.get("/api/debug/local-file-types/{cid}")
+def debug_local_file_types(cid: str):
+    """Inspect actual local file bytes and media types for a candidate."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT name, local_folder_path FROM candidates WHERE id = ?", (cid,)).fetchone()
+
+    if not row:
+        raise HTTPException(404, "Candidate not found")
+
+    local_folder = row["local_folder_path"] or candidate_local_folder(cid, row["name"])
+    if not os.path.isdir(local_folder):
+        raise HTTPException(404, "Local candidate folder not found")
+
+    results = []
+    for filename in sorted(os.listdir(local_folder)):
+        path = os.path.join(local_folder, filename)
+        if not os.path.isfile(path):
+            continue
+
+        with open(path, "rb") as handle:
+            first_bytes = handle.read(512)
+
+        detected = detect_file_type(first_bytes, mimetypes.guess_type(path)[0] or "")
+        results.append({
+            "filename": filename,
+            "size_bytes": os.path.getsize(path),
+            "content_type": detected["content_type"],
+            "detected_type": "HTML page saved as file" if is_html_bytes(first_bytes) else detected["detected_type"],
+            "previewable": detected["previewable"],
+            "first_bytes_hex": first_bytes[:32].hex(),
+        })
+
+    return {"candidate_id": cid, "local_folder": local_folder, "files": results}
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # FRONTEND SERVING
