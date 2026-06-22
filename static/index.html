@@ -447,6 +447,7 @@ const COLORS = ['#C8502A','#7B5EA7','#2A7B9B','#B8862A','#2A7B6F','#6B4A9E','#2A
 let candidates = [];
 let editingId = null;
 let currentDetailId = null;
+let currentDetailReferenceEntries = [];
 let activeStage = 'All';
 let activeRole = 'All';
 let searchQuery = '';
@@ -540,23 +541,28 @@ function referenceSectionHtml(referenceEntries) {
   return `<div style="margin-top:14px; font-weight:600;">References</div>${referenceEntries.join('<br><br>')}`;
 }
 
-async function renderCandidateSavedDocuments(candidate, referenceEntries = []) {
-  const target = document.getElementById('dp-documents');
-  target.innerHTML = 'Loading saved local documents…';
+async function renderSubmissionDocuments(candidate, submissionNumber, referenceEntries = []) {
+  const body = document.getElementById('submission-documents-body');
+  if (!body) return;
+
+  body.innerHTML = 'Loading selected submission documents…';
 
   try {
-    const localInfo = await apiFetch(`/candidates/${candidate.id}/local-files`);
+    const localInfo = await apiFetch(`/candidates/${candidate.id}/local-files?submission_number=${encodeURIComponent(submissionNumber)}`);
     const entries = [];
 
     if (localInfo.folder_exists && localInfo.files && localInfo.files.length) {
       entries.push(...localInfo.files.map(localDocumentHtml));
     } else {
-      entries.push('<div>No saved local documents were found for this candidate.</div>');
+      entries.push('<div>No saved local documents were found for this submission.</div>');
     }
 
-    if (localInfo.sharepoint_folder_url || candidate.sharepoint_folder_url) {
-      const sharepointUrl = localInfo.sharepoint_folder_url || candidate.sharepoint_folder_url;
-      entries.push(`<div style="margin-top:14px;"><strong>SharePoint:</strong> <a href="${esc(sharepointUrl)}" target="_blank" rel="noreferrer">Open synced folder</a></div>`);
+    if (localInfo.sharepoint_folder_url) {
+      entries.push(`<div style="margin-top:14px;"><strong>SharePoint submission folder:</strong> <a href="${esc(localInfo.sharepoint_folder_url)}" target="_blank" rel="noreferrer">Open selected submission</a></div>`);
+    }
+
+    if (candidate.sharepoint_folder_url) {
+      entries.push(`<div><strong>SharePoint candidate folder:</strong> <a href="${esc(candidate.sharepoint_folder_url)}" target="_blank" rel="noreferrer">Open all submissions</a></div>`);
     }
 
     if (localInfo.errors && localInfo.errors.length) {
@@ -567,10 +573,96 @@ async function renderCandidateSavedDocuments(candidate, referenceEntries = []) {
     const refs = referenceSectionHtml(referenceEntries);
     if (refs) entries.push(refs);
 
-    target.innerHTML = entries.join('') || 'No uploaded document details available.';
+    body.innerHTML = entries.join('') || 'No uploaded document details available.';
   } catch (e) {
     const refs = referenceSectionHtml(referenceEntries);
-    target.innerHTML = `Could not load saved local documents: ${esc(e.message)}${refs ? '<br><br>' + refs : ''}`;
+    body.innerHTML = `Could not load selected submission documents: ${esc(e.message)}${refs ? '<br><br>' + refs : ''}`;
+  }
+}
+
+async function renderCandidateSavedDocuments(candidate, referenceEntries = []) {
+  const target = document.getElementById('dp-documents');
+  currentDetailReferenceEntries = referenceEntries;
+  target.innerHTML = 'Loading saved submission versions…';
+
+  try {
+    const info = await apiFetch(`/candidates/${candidate.id}/submissions`);
+    const submissions = info.submissions || [];
+
+    if (!submissions.length) {
+      target.innerHTML = '<div>No saved submissions were found for this candidate.</div>' + referenceSectionHtml(referenceEntries);
+      return;
+    }
+
+    const latest = submissions[submissions.length - 1];
+    const options = submissions.map(s => {
+      const status = s.sharepoint_sync_status || s.storage_status || 'Saved locally';
+      const label = `${s.display_name || ('Submission ' + s.submission_number)} — ${status}`;
+      const selected = s.submission_number === latest.submission_number ? 'selected' : '';
+      return `<option value="${esc(s.submission_number)}" ${selected}>${esc(label)}</option>`;
+    }).join('');
+
+    const versionRows = submissions.map(s => {
+      const sp = s.sharepoint_folder_url
+        ? `<a href="${esc(s.sharepoint_folder_url)}" target="_blank" rel="noreferrer">SharePoint</a>`
+        : 'Local only';
+      const created = s.created_at ? ` • ${esc(s.created_at)}` : '';
+      return `<div class="local-doc-meta">${esc(s.display_name || ('Submission ' + s.submission_number))}: ${esc(s.file_count || 0)} file(s) • ${esc(s.storage_status || '')} • ${sp}${created}</div>`;
+    }).join('');
+
+    target.innerHTML = `
+      <div class="field" style="margin-bottom:12px;">
+        <label>Select submission version</label>
+        <select id="submission-version-select" onchange="renderSubmissionDocumentsBySelection()">
+          ${options}
+        </select>
+      </div>
+      <div style="margin-bottom:12px;">
+        <strong>Submission versions</strong>
+        ${versionRows}
+      </div>
+      <div id="submission-documents-body">Loading selected submission…</div>
+      <div id="candidate-change-history" style="margin-top:16px;"></div>
+    `;
+
+    await renderSubmissionDocuments(candidate, latest.submission_number, referenceEntries);
+    await renderCandidateChangeHistory(candidate.id);
+  } catch (e) {
+    const refs = referenceSectionHtml(referenceEntries);
+    target.innerHTML = `Could not load submission versions: ${esc(e.message)}${refs ? '<br><br>' + refs : ''}`;
+  }
+}
+
+async function renderSubmissionDocumentsBySelection() {
+  if (!currentDetailId) return;
+  const c = candidates.find(x => x.id === currentDetailId);
+  const select = document.getElementById('submission-version-select');
+  if (!c || !select) return;
+  await renderSubmissionDocuments(c, select.value, currentDetailReferenceEntries);
+}
+
+async function renderCandidateChangeHistory(candidateId) {
+  const target = document.getElementById('candidate-change-history');
+  if (!target) return;
+
+  try {
+    const data = await apiFetch(`/candidates/${candidateId}/versions`);
+    const versions = data.versions || [];
+    if (!versions.length) {
+      target.innerHTML = '';
+      return;
+    }
+
+    const rows = versions.map(v => {
+      const diff = v.diff_json || {};
+      const changedFields = Object.keys(diff).filter(k => !['local_folder_path', 'sharepoint_sync_status', 'sharepoint_folder_id', 'sharepoint_folder_url', 'sharepoint_folder_path'].includes(k));
+      const summary = changedFields.length ? changedFields.map(f => esc(f.replaceAll('_', ' '))).join(', ') : 'No visible field changes';
+      return `<div class="local-doc-meta"><strong>Version ${esc(v.version_number)}</strong> — ${esc(v.source)} / ${esc(v.action)} • ${summary}</div>`;
+    }).join('');
+
+    target.innerHTML = `<div style="margin-top:14px; font-weight:600;">Candidate change history</div>${rows}`;
+  } catch (e) {
+    target.innerHTML = `<div class="local-doc-meta">Could not load change history: ${esc(e.message)}</div>`;
   }
 }
 
@@ -1101,6 +1193,35 @@ async function ensureSharePointCandidateFolder(folderName, options = {}) {
   }
 }
 
+async function ensureSharePointChildFolder(parentFolderId, folderName, options = {}) {
+  const destination = await getSharePointDestinationForSync();
+  const driveId = destination.drive_id;
+  const encodedName = encodeURIComponent(folderName);
+  const graphOptions = { interactive: options.interactive !== false };
+
+  try {
+    return await graphFetch(`/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(parentFolderId)}:/${encodedName}`, graphOptions);
+  } catch (e) {
+    // Continue and try to create it.
+  }
+
+  try {
+    return await graphFetch(`/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(parentFolderId)}/children`, {
+      method: 'POST',
+      contentType: 'application/json',
+      interactive: options.interactive !== false,
+      body: JSON.stringify({
+        name: folderName,
+        folder: {},
+        '@microsoft.graph.conflictBehavior': 'fail'
+      })
+    });
+  } catch (e) {
+    // If another sync created it between the GET and POST, fetch it again.
+    return await graphFetch(`/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(parentFolderId)}:/${encodedName}`, graphOptions);
+  }
+}
+
 async function uploadLocalFileToSharePoint(folderId, fileInfo, options = {}) {
   const destination = await getSharePointDestinationForSync();
   const driveId = destination.drive_id;
@@ -1123,50 +1244,80 @@ async function uploadLocalFileToSharePoint(folderId, fileInfo, options = {}) {
 
 async function syncCandidateToSharePoint(candidateId, options = {}) {
   const destination = await getSharePointDestinationForSync();
-  const localInfo = await apiFetch(`/candidates/${candidateId}/local-files`);
+  const submissionsInfo = await apiFetch(`/candidates/${candidateId}/submissions`);
+  const submissions = submissionsInfo.submissions || [];
 
-  if (!localInfo.folder_exists || !localInfo.files.length) {
-    throw new Error(`No local files found for ${localInfo.candidate_name || candidateId}`);
+  if (!submissions.length) {
+    throw new Error(`No saved submissions found for ${submissionsInfo.candidate_name || candidateId}`);
   }
 
-  const folder = await ensureSharePointCandidateFolder(localInfo.folder_name, options);
-  const folderPath = [destination.base_folder, localInfo.folder_name].filter(Boolean).join('/');
+  const candidateFolderName = submissionsInfo.candidate_folder_name || candidateId;
+  const candidateFolder = await ensureSharePointCandidateFolder(candidateFolderName, options);
+  const candidateFolderPath = [destination.base_folder, candidateFolderName].filter(Boolean).join('/');
 
-  const uploadedFiles = [];
-  const failedFiles = [];
+  const pendingSubmissions = submissions.filter(s =>
+    s.folder_exists && (!s.sharepoint_folder_url || !String(s.sharepoint_sync_status || '').toLowerCase().startsWith('synced'))
+  );
 
-  for (const fileInfo of localInfo.files) {
+  if (!pendingSubmissions.length) {
+    return { uploadedSubmissionCount: 0, skipped: true };
+  }
+
+  let uploadedSubmissionCount = 0;
+  const failedSubmissions = [];
+
+  for (const submission of pendingSubmissions) {
     try {
-      await uploadLocalFileToSharePoint(folder.id, fileInfo, options);
-      uploadedFiles.push(fileInfo.filename);
-    } catch (error) {
-      console.error(`[SHAREPOINT SYNC] Failed to upload ${fileInfo.filename}:`, error);
-      failedFiles.push({
-        filename: fileInfo.filename,
-        error: error.message || String(error)
+      const submissionFolderName = submission.submission_folder_name || `Submission_${String(submission.submission_number).padStart(3, '0')}`;
+      const submissionFolder = await ensureSharePointChildFolder(candidateFolder.id, submissionFolderName, options);
+      const submissionFolderPath = [candidateFolderPath, submissionFolderName].filter(Boolean).join('/');
+      const localInfo = await apiFetch(`/candidates/${candidateId}/local-files?submission_number=${encodeURIComponent(submission.submission_number)}`);
+
+      if (!localInfo.folder_exists || !localInfo.files.length) {
+        throw new Error(`No files found for ${submission.display_name || submissionFolderName}`);
+      }
+
+      const failedFiles = [];
+      for (const fileInfo of localInfo.files) {
+        try {
+          await uploadLocalFileToSharePoint(submissionFolder.id, fileInfo, options);
+        } catch (error) {
+          failedFiles.push({ filename: fileInfo.filename, error: error.message || String(error) });
+        }
+      }
+
+      const status = failedFiles.length
+        ? `Partially synced - ${failedFiles.length} file(s) failed`
+        : 'Synced';
+
+      await apiFetch(`/candidates/${candidateId}/sharepoint-sync`, {
+        method: 'POST',
+        body: JSON.stringify({
+          folder_id: candidateFolder.id,
+          folder_url: candidateFolder.webUrl,
+          folder_path: candidateFolderPath,
+          status,
+          submission_number: submission.submission_number,
+          submission_folder_id: submissionFolder.id,
+          submission_folder_url: submissionFolder.webUrl,
+          submission_folder_path: submissionFolderPath
+        })
       });
+
+      if (failedFiles.length) {
+        throw new Error(`${submission.display_name || submissionFolderName}: ${failedFiles.length} file(s) failed to upload.`);
+      }
+
+      uploadedSubmissionCount += 1;
+    } catch (error) {
+      failedSubmissions.push({ submission_number: submission.submission_number, error: error.message || String(error) });
+      if (options.interactive !== false) {
+        throw error;
+      }
     }
   }
 
-  const status = failedFiles.length
-    ? `Partially synced - ${failedFiles.length} file(s) failed`
-    : 'Synced';
-
-  await apiFetch(`/candidates/${candidateId}/sharepoint-sync`, {
-    method: 'POST',
-    body: JSON.stringify({
-      folder_id: folder.id,
-      folder_url: folder.webUrl,
-      folder_path: folderPath,
-      status
-    })
-  });
-
-  if (failedFiles.length) {
-    throw new Error(
-      `SharePoint folder was created, but ${failedFiles.length} file(s) failed to upload.`
-    );
-  }
+  return { uploadedSubmissionCount, failedSubmissions };
 }
 
 async function syncPendingSharePoint(options = {}) {
@@ -1182,20 +1333,16 @@ async function syncPendingSharePoint(options = {}) {
   try {
     await getSharePointDestinationForSync();
 
-    // Always check all candidates, not only the current filtered/searched view.
+    // Check all candidates because an existing candidate can have a new unsynced submission.
     const allCandidates = await apiFetch('/candidates');
-    const pending = allCandidates.filter(c => !c.sharepoint_folder_url);
-
-    if (!pending.length) {
-      if (manual) toast('No pending local files to sync');
-      return { successCount: 0, pendingCount: 0 };
-    }
 
     let successCount = 0;
-    for (const candidate of pending) {
+    let checkedCount = 0;
+    for (const candidate of allCandidates) {
       try {
-        await syncCandidateToSharePoint(candidate.id, { interactive });
-        successCount += 1;
+        const result = await syncCandidateToSharePoint(candidate.id, { interactive });
+        checkedCount += 1;
+        successCount += result.uploadedSubmissionCount || 0;
       } catch (candidateError) {
         console.error(`[SHAREPOINT SYNC] Failed for ${candidate.name || candidate.id}:`, candidateError);
         if (manual) {
@@ -1204,16 +1351,20 @@ async function syncPendingSharePoint(options = {}) {
       }
     }
 
+    if (!successCount && manual) {
+      toast('No pending submission folders to sync');
+    }
+
     if (successCount > 0) {
       await refresh();
       await loadMicrosoftIntegrationStatus();
     }
 
     if (manual) {
-      toast(`Synced ${successCount} candidate${successCount !== 1 ? 's' : ''} to SharePoint`);
+      toast(`Synced ${successCount} submission folder${successCount !== 1 ? 's' : ''} to SharePoint`);
     }
 
-    return { successCount, pendingCount: pending.length };
+    return { successCount, pendingCount: checkedCount };
   } catch (e) {
     if (manual) {
       toast(e.message, true);

@@ -268,6 +268,54 @@ def init_db() -> None:
             )
         """)
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS candidate_versions (
+                id TEXT PRIMARY KEY,
+                candidate_id TEXT NOT NULL,
+                version_number INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                action TEXT NOT NULL,
+                changed_by TEXT,
+                jotform_form_id TEXT,
+                jotform_submission_id TEXT,
+                before_json TEXT,
+                incoming_json TEXT,
+                after_json TEXT,
+                diff_json TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY(candidate_id) REFERENCES candidates(id)
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS candidate_submissions (
+                id TEXT PRIMARY KEY,
+                candidate_id TEXT NOT NULL,
+                submission_number INTEGER NOT NULL,
+                jotform_form_id TEXT,
+                jotform_submission_id TEXT,
+                local_folder_path TEXT,
+                storage_status TEXT,
+                sharepoint_sync_status TEXT,
+                sharepoint_folder_id TEXT,
+                sharepoint_folder_url TEXT,
+                sharepoint_folder_path TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT,
+                FOREIGN KEY(candidate_id) REFERENCES candidates(id)
+            )
+        """)
+
+        submission_cols = get_existing_columns(conn, "candidate_submissions")
+        for column in [
+            "sharepoint_sync_status",
+            "sharepoint_folder_id",
+            "sharepoint_folder_url",
+            "sharepoint_folder_path",
+            "updated_at",
+        ]:
+            if column not in submission_cols:
+                conn.execute(f"ALTER TABLE candidate_submissions ADD COLUMN {column} TEXT")
 # ───────────────────────────────────────────────────────────────────────────────
 # PYDANTIC MODELS
 # ───────────────────────────────────────────────────────────────────────────────
@@ -313,11 +361,19 @@ class CandidateOut(CandidateIn):
 
 
 class SharePointSyncIn(BaseModel):
-    """Payload sent by the browser after it syncs local files to SharePoint."""
+    """Payload sent by the browser after it syncs local files to SharePoint.
+
+    folder_* refers to the main candidate folder. submission_folder_* refers to
+    a specific Submission_001 / Submission_002 folder inside the candidate folder.
+    """
     folder_id: Optional[str] = None
     folder_url: Optional[str] = None
     folder_path: Optional[str] = None
     status: Optional[str] = "Synced"
+    submission_number: Optional[int] = None
+    submission_folder_id: Optional[str] = None
+    submission_folder_url: Optional[str] = None
+    submission_folder_path: Optional[str] = None
 
 
 class SharePointDestinationIn(BaseModel):
@@ -531,11 +587,10 @@ def validate_candidate(data: CandidateIn) -> None:
     if data.stage not in VALID_STAGES:
         raise HTTPException(400, f"Stage must be one of: {sorted(VALID_STAGES)}")
 
-
 def normalise_candidate_payload(data: CandidateIn) -> dict:
-    """Return a clean dictionary containing only database candidate fields."""
-    payload = data.dict()
+    payload = data.model_dump()
     payload["name"] = payload.get("name", "").strip()
+    payload["email"] = normalise_email(payload.get("email"))
     return {field: payload.get(field) or "" for field in CANDIDATE_FIELDS}
 
 
@@ -587,20 +642,102 @@ def update_candidate_record(
     row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
     return row_to_dict(row)
 
+def normalise_email(email: Optional[str]) -> str:
+    return (email or "").strip().lower()
 
 def find_existing_candidate(
     conn: sqlite3.Connection,
     email: str,
-    full_name: str,
 ) -> Optional[sqlite3.Row]:
-    """Find an existing candidate by email first, then by full name."""
-    if email:
-        candidate = conn.execute("SELECT id FROM candidates WHERE email = ?", (email,)).fetchone()
-        if candidate:
-            return candidate
-    if full_name:
-        return conn.execute("SELECT id FROM candidates WHERE name = ?", (full_name,)).fetchone()
-    return None
+    """Find an existing candidate by email only."""
+    email = normalise_email(email)
+
+    if not email:
+        return None
+
+    return conn.execute(
+        "SELECT id FROM candidates WHERE lower(trim(email)) = ?",
+        (email,),
+    ).fetchone()
+
+def next_candidate_version(conn: sqlite3.Connection, candidate_id: str) -> int:
+    row = conn.execute(
+        "SELECT COALESCE(MAX(version_number), 0) + 1 AS next_version "
+        "FROM candidate_versions WHERE candidate_id = ?",
+        (candidate_id,),
+    ).fetchone()
+    return int(row["next_version"])
+
+
+def next_submission_number(conn: sqlite3.Connection, candidate_id: str) -> int:
+    row = conn.execute(
+        "SELECT COALESCE(MAX(submission_number), 0) + 1 AS next_submission "
+        "FROM candidate_submissions WHERE candidate_id = ?",
+        (candidate_id,),
+    ).fetchone()
+    return int(row["next_submission"])
+
+
+def candidate_snapshot(candidate: dict) -> dict:
+    return {field: candidate.get(field, "") for field in CANDIDATE_FIELDS}
+
+
+def make_diff(before: Optional[dict], after: dict) -> dict:
+    before = before or {}
+    diff = {}
+
+    for key in CANDIDATE_FIELDS:
+        old_value = before.get(key, "")
+        new_value = after.get(key, "")
+
+        if old_value != new_value:
+            diff[key] = {
+                "before": old_value,
+                "after": new_value,
+            }
+
+    return diff
+
+
+def record_candidate_version(
+    conn: sqlite3.Connection,
+    *,
+    candidate_id: str,
+    source: str,
+    action: str,
+    before: Optional[dict],
+    incoming: Optional[dict],
+    after: dict,
+    changed_by: str = "",
+    jotform_context: Optional[dict] = None,
+) -> None:
+    version_number = next_candidate_version(conn, candidate_id)
+    diff = make_diff(before, after)
+
+    conn.execute(
+        """
+        INSERT INTO candidate_versions (
+            id, candidate_id, version_number, source, action, changed_by,
+            jotform_form_id, jotform_submission_id,
+            before_json, incoming_json, after_json, diff_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(uuid.uuid4()),
+            candidate_id,
+            version_number,
+            source,
+            action,
+            changed_by,
+            (jotform_context or {}).get("form_id", ""),
+            (jotform_context or {}).get("submission_id", ""),
+            json.dumps(before or {}, ensure_ascii=False),
+            json.dumps(incoming or {}, ensure_ascii=False),
+            json.dumps(after, ensure_ascii=False),
+            json.dumps(diff, ensure_ascii=False),
+        ),
+    )
 
 # ───────────────────────────────────────────────────────────────────────────────
 # JOTFORM PARSING HELPERS
@@ -1086,7 +1223,7 @@ def get_media_type_for_file(path: str) -> str:
         return mimetypes.guess_type(path)[0] or "application/octet-stream"
 
 def build_submission_summary(full_name: str, fields: dict, document_urls: dict) -> str:
-    """Create the submission_details.txt content using expected saved documents and references."""
+    """Create submission_details.txt without exposing source file URLs."""
 
     def clean_value(value):
         if value is None:
@@ -1110,22 +1247,17 @@ def build_submission_summary(full_name: str, fields: dict, document_urls: dict) 
                 return value
         return "N/A"
 
-    def get_document_value(*keys):
+    def get_document_status(*keys):
+        """Return whether a document field was supplied, without printing the URL."""
         for key in keys:
-            value = clean_value(document_urls.get(key))
-            if value != "N/A":
-                return value
+            if clean_value(document_urls.get(key)) != "N/A":
+                return "Provided"
 
         for key in keys:
-            value = clean_value(fields.get(key))
-            if value != "N/A":
-                return value
+            if clean_value(fields.get(key)) != "N/A":
+                return "Provided"
 
-        return "N/A"
-
-    def get_signature_status():
-        signature_value = get_document_value("signature")
-        return "Provided" if signature_value != "N/A" else "N/A"
+        return "Not provided"
 
     def format_reference(reference_value):
         if not reference_value:
@@ -1174,19 +1306,19 @@ def build_submission_summary(full_name: str, fields: dict, document_urls: dict) 
 
     summary_lines.extend([
         "",
-        "Document Links:",
-        f"NDIS worker check: {get_document_value('ndis_worker_check')}",
-        f"Police check: {get_document_value('police_check')}",
-        f"Working with children: {get_document_value('working_with_children')}",
-        f"100 points ID: {get_document_value('id_100_points')}",
-        f"First aid / CPR: {get_document_value('first_aid_cpr')}",
-        f"NDIS orientation: {get_document_value('ndis_orientation')}",
-        f"COVID training: {get_document_value('covid_training')}",
-        f"Car insurance: {get_document_value('car_insurance')}",
-        f"Car registration proof: {get_document_value('car_rego_proof')}",
-        f"Face ID picture: {get_document_value('face_id_picture')}",
-        f"Certificates / study: {get_document_value('certificates_study')}",
-        f"Signature: {get_signature_status()}",
+        "Documents Provided:",
+        f"NDIS worker check: {get_document_status('ndis_worker_check')}",
+        f"Police check: {get_document_status('police_check')}",
+        f"Working with children: {get_document_status('working_with_children')}",
+        f"100 points ID: {get_document_status('id_100_points')}",
+        f"First aid / CPR: {get_document_status('first_aid_cpr')}",
+        f"NDIS orientation: {get_document_status('ndis_orientation')}",
+        f"COVID training: {get_document_status('covid_training')}",
+        f"Car insurance: {get_document_status('car_insurance')}",
+        f"Car registration proof: {get_document_status('car_rego_proof')}",
+        f"Face ID picture: {get_document_status('face_id_picture')}",
+        f"Certificates / study: {get_document_status('certificates_study')}",
+        f"Signature: {get_document_status('signature')}",
     ])
 
     return "\n".join(summary_lines) + "\n"
@@ -1206,6 +1338,44 @@ def candidate_folder_name(cid: str, full_name: Optional[str] = None) -> str:
 def candidate_local_folder(cid: str, full_name: Optional[str] = None) -> str:
     """Return the local storage folder for a candidate."""
     return os.path.join(STORAGE_ROOT, candidate_folder_name(cid, full_name))
+
+
+def submission_folder_name(submission_number: int, submission_id: Optional[str] = None) -> str:
+    """Return a stable folder name for one candidate submission version."""
+    suffix = sanitize_filename(str(submission_id or "")).strip("_")
+    if suffix and suffix.lower() != "unknown":
+        return f"Submission_{submission_number:03d}_{suffix}"
+    return f"Submission_{submission_number:03d}"
+
+
+def submission_display_name(submission_number: int) -> str:
+    return f"Submission {submission_number}"
+
+
+def get_candidate_submission_row(
+    conn: sqlite3.Connection,
+    cid: str,
+    submission_number: Optional[int] = None,
+) -> Optional[sqlite3.Row]:
+    """Return one submission row. If no number is provided, return the latest submission."""
+    if submission_number is not None:
+        return conn.execute(
+            """
+            SELECT * FROM candidate_submissions
+            WHERE candidate_id = ? AND submission_number = ?
+            """,
+            (cid, submission_number),
+        ).fetchone()
+
+    return conn.execute(
+        """
+        SELECT * FROM candidate_submissions
+        WHERE candidate_id = ?
+        ORDER BY submission_number DESC
+        LIMIT 1
+        """,
+        (cid,),
+    ).fetchone()
 
 
 def save_local_submission_files(
@@ -1339,13 +1509,25 @@ def save_candidate_submission(
     document_urls: dict,
     jotform_context: Optional[dict] = None,
 ) -> None:
-    """Save the JotForm submission locally for later browser-based SharePoint sync."""
-    local_folder = candidate_local_folder(cid, candidate.name)
+    """Save each JotForm submission into its own versioned local folder."""
+    with get_conn() as conn:
+        submission_number = next_submission_number(conn, cid)
+
+    submission_id = (jotform_context or {}).get("submission_id") or "unknown"
+    safe_submission_id = sanitize_filename(str(submission_id))
+
+    candidate_folder = candidate_local_folder(cid, candidate.name)
+    local_folder = os.path.join(
+        candidate_folder,
+        "submissions",
+        submission_folder_name(submission_number, safe_submission_id),
+    )
 
     summary_text = build_submission_summary(
         candidate.name,
         {
             "candidate_id": cid,
+            "submission_number": submission_number,
             "full_name": candidate.name,
             "email": candidate.email,
             "mobile_number": candidate.mobile_number,
@@ -1360,12 +1542,39 @@ def save_candidate_submission(
         document_urls,
     )
 
-    storage_result = save_local_submission_files(local_folder, summary_text, document_urls, jotform_context)
+    storage_result = save_local_submission_files(
+        local_folder,
+        summary_text,
+        document_urls,
+        jotform_context,
+    )
+
     sync_status = "Pending browser sync"
     if storage_result.get("errors"):
         sync_status = "Pending browser sync - some files failed validation"
 
     with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO candidate_submissions (
+                id, candidate_id, submission_number, jotform_form_id,
+                jotform_submission_id, local_folder_path, storage_status,
+                sharepoint_sync_status, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            """,
+            (
+                str(uuid.uuid4()),
+                cid,
+                submission_number,
+                (jotform_context or {}).get("form_id", ""),
+                (jotform_context or {}).get("submission_id", ""),
+                local_folder,
+                sync_status,
+                sync_status,
+            ),
+        )
+
         conn.execute(
             """
             UPDATE candidates
@@ -1376,10 +1585,10 @@ def save_candidate_submission(
                 END
             WHERE id = ?
             """,
-            (local_folder, sync_status, cid),
+            (candidate_folder, sync_status, cid),
         )
 
-    print("[STORAGE DEBUG] Submission files saved locally", storage_result)
+    print("[STORAGE DEBUG] Submission version saved locally", storage_result)
 
 # ───────────────────────────────────────────────────────────────────────────────
 # API ROUTES - WEBHOOK
@@ -1412,26 +1621,58 @@ async def jotform_webhook(request: Request):
 
 
 def handle_document_request(raw: dict, jotform_context: Optional[dict] = None):
-    """Create or update a candidate from a JotForm document request submission."""
     candidate, document_urls = build_candidate_from_jotform(raw)
 
     with get_conn() as conn:
-        existing_candidate = find_existing_candidate(conn, candidate.email or "", candidate.name)
+        existing_candidate = find_existing_candidate(conn, candidate.email or "")
 
         if existing_candidate:
             cid = existing_candidate["id"]
-            print(f"[WEBHOOK DEBUG] updating existing candidate {cid} with JotForm data")
-            result = update_candidate_record(conn, cid, candidate, preserve_existing_values=True)
-        else:
-            print(f"[WEBHOOK DEBUG] creating new candidate for {candidate.name}")
-            result = insert_candidate_record(conn, candidate)
 
-    cid = result.get("id")
-    print(f"[WEBHOOK DEBUG] candidate UUID: {cid}")
+            before_row = conn.execute(
+                "SELECT * FROM candidates WHERE id = ?",
+                (cid,),
+            ).fetchone()
+            before = candidate_snapshot(row_to_dict(before_row))
+
+            result = update_candidate_record(
+                conn,
+                cid,
+                candidate,
+                preserve_existing_values=True,
+            )
+
+            action = "jotform_update"
+
+        else:
+            before = None
+            result = insert_candidate_record(conn, candidate)
+            cid = result["id"]
+            action = "jotform_create"
+
+        after_row = conn.execute(
+            "SELECT * FROM candidates WHERE id = ?",
+            (cid,),
+        ).fetchone()
+        after = candidate_snapshot(row_to_dict(after_row))
+
+        record_candidate_version(
+            conn,
+            candidate_id=cid,
+            source="jotform",
+            action=action,
+            before=before,
+            incoming=normalise_candidate_payload(candidate),
+            after=after,
+            changed_by="JotForm webhook",
+            jotform_context=jotform_context,
+        )
+
     save_candidate_submission(cid, candidate, document_urls, jotform_context)
 
     with get_conn() as conn:
         refreshed = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
+
     return row_to_dict(refreshed)
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -1467,36 +1708,66 @@ def list_candidates(
 
 @app.post("/api/candidates", response_model=CandidateOut, status_code=201)
 def create_candidate(data: CandidateIn):
-    """Create a new candidate record."""
+    """Create a new candidate record and record the website creation as version 1."""
     with get_conn() as conn:
         created = insert_candidate_record(conn, data)
+        record_candidate_version(
+            conn,
+            candidate_id=created["id"],
+            source="website",
+            action="website_create",
+            before=None,
+            incoming=normalise_candidate_payload(data),
+            after=candidate_snapshot(created),
+            changed_by="Website user",
+        )
     print(f"[WEBHOOK DEBUG] candidate UUID: {created.get('id')}")
     return created
 
 
 @app.get("/api/candidates/{cid}/local-files")
-def list_candidate_local_files(cid: str):
-    """List locally saved files for preview and browser SharePoint sync."""
+def list_candidate_local_files(cid: str, submission_number: Optional[int] = None):
+    """List files for one submission version. Defaults to the latest submission."""
     with get_conn() as conn:
-        row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
+        candidate_row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
+        submission_row = get_candidate_submission_row(conn, cid, submission_number)
 
-    if not row:
+    if not candidate_row:
         raise HTTPException(404, "Candidate not found")
-  
 
-    candidate = row_to_dict(row)
-    folder_name = candidate_folder_name(cid, candidate.get("name"))
-    local_folder = candidate.get("local_folder_path") or candidate_local_folder(cid, candidate.get("name"))
+    candidate = row_to_dict(candidate_row)
+    candidate_folder = candidate.get("local_folder_path") or candidate_local_folder(cid, candidate.get("name"))
+    candidate_folder_basename = os.path.basename(candidate_folder.rstrip("/\\")) or candidate_folder_name(cid, candidate.get("name"))
+
+    if submission_row:
+        submission = row_to_dict(submission_row)
+        selected_submission_number = int(submission.get("submission_number") or 0)
+        local_folder = submission.get("local_folder_path") or os.path.join(
+            candidate_folder,
+            "submissions",
+            submission_folder_name(selected_submission_number, submission.get("jotform_submission_id")),
+        )
+        current_submission_folder_name = os.path.basename(local_folder.rstrip("/\\")) or submission_folder_name(selected_submission_number)
+    else:
+        submission = None
+        selected_submission_number = None
+        local_folder = candidate_folder
+        current_submission_folder_name = ""
+
     if not os.path.isdir(local_folder):
         return {
             "candidate_id": cid,
-            "folder_name": os.path.basename(local_folder.rstrip("/\\")) or folder_name,
+            "candidate_name": candidate.get("name") or "",
+            "candidate_folder_name": candidate_folder_basename,
+            "folder_name": candidate_folder_basename,
+            "submission_number": selected_submission_number,
+            "submission_display_name": submission_display_name(selected_submission_number) if selected_submission_number else "Latest submission",
+            "submission_folder_name": current_submission_folder_name,
             "folder_exists": False,
             "files": [],
             "errors": [],
-            "message": "No local files were found for this candidate.",
+            "message": "No local files were found for this submission.",
         }
-
 
     manifest = load_local_documents_manifest(local_folder)
     manifest_files = manifest.get("files") or []
@@ -1513,52 +1784,63 @@ def list_candidate_local_files(cid: str):
 
         metadata = manifest_by_name.get(filename, {})
         content_type = metadata.get("content_type") or get_media_type_for_file(file_path)
+        with open(file_path, "rb") as handle:
+            detected_type = detect_file_type(handle.read(512), content_type)["detected_type"]
         files.append({
             "filename": filename,
             "label": metadata.get("label") or filename,
             "document_key": metadata.get("document_key") or os.path.splitext(filename)[0],
             "content_type": content_type,
-            "detected_type": metadata.get("detected_type") or detect_file_type(open(file_path, "rb").read(512), content_type)["detected_type"],
+            "detected_type": metadata.get("detected_type") or detected_type,
             "previewable": bool(metadata.get("previewable", content_type.startswith("image/") or content_type in {"application/pdf", "text/plain"})),
             "size_bytes": os.path.getsize(file_path),
-            "download_url": f"/api/candidates/{cid}/files/{quote(filename, safe='')}",
+            "download_url": f"/api/candidates/{cid}/files/{quote(filename, safe='')}" + (f"?submission_number={selected_submission_number}" if selected_submission_number else ""),
         })
 
     return {
         "candidate_id": cid,
         "candidate_name": candidate.get("name") or "",
-        "folder_name": os.path.basename(local_folder.rstrip("/\\")) or folder_name,
+        "candidate_folder_name": candidate_folder_basename,
+        "folder_name": candidate_folder_basename,
+        "submission_number": selected_submission_number,
+        "submission_display_name": submission_display_name(selected_submission_number) if selected_submission_number else "Latest submission",
+        "submission_folder_name": current_submission_folder_name,
         "folder_exists": True,
         "sharepoint_destination": {
             "configured": bool(get_sharepoint_destination()),
             "display_path": destination_display_path(get_sharepoint_destination()),
         },
-        "sharepoint_sync_status": candidate.get("sharepoint_sync_status") or "",
-        "sharepoint_folder_url": candidate.get("sharepoint_folder_url") or "",
+        "sharepoint_sync_status": (submission or {}).get("sharepoint_sync_status") or candidate.get("sharepoint_sync_status") or "",
+        "sharepoint_folder_url": (submission or {}).get("sharepoint_folder_url") or candidate.get("sharepoint_folder_url") or "",
         "files": files,
         "errors": manifest.get("errors") or [],
     }
 
 
 @app.get("/api/candidates/{cid}/files/{filename:path}")
-def download_candidate_local_file(cid: str, filename: str):
-    """Serve one locally saved candidate file to the browser."""
+def download_candidate_local_file(cid: str, filename: str, submission_number: Optional[int] = None):
+    """Serve one locally saved candidate file from a selected submission version."""
     safe_filename = os.path.basename(filename)
     if safe_filename != filename:
         raise HTTPException(400, "Invalid filename")
 
     with get_conn() as conn:
-        row = conn.execute("SELECT name, local_folder_path FROM candidates WHERE id = ?", (cid,)).fetchone()
+        candidate_row = conn.execute("SELECT id, name, local_folder_path FROM candidates WHERE id = ?", (cid,)).fetchone()
+        submission_row = get_candidate_submission_row(conn, cid, submission_number)
 
-    if not row:
+    if not candidate_row:
         raise HTTPException(404, "Candidate not found")
 
-    local_folder = row["local_folder_path"] or candidate_local_folder(cid, row["name"])
+    candidate_folder = candidate_row["local_folder_path"] or candidate_local_folder(cid, candidate_row["name"])
+    if submission_row:
+        local_folder = submission_row["local_folder_path"]
+    else:
+        local_folder = candidate_folder
+
     file_path = os.path.join(local_folder, safe_filename)
 
     if not os.path.isfile(file_path):
         raise HTTPException(404, "Local file not found")
-
 
     return FileResponse(
         file_path,
@@ -1570,7 +1852,7 @@ def download_candidate_local_file(cid: str, filename: str):
 
 @app.post("/api/candidates/{cid}/sharepoint-sync", response_model=CandidateOut)
 def update_candidate_sharepoint_sync(cid: str, data: SharePointSyncIn):
-    """Store SharePoint metadata after the browser uploads local files using Graph."""
+    """Store SharePoint metadata after browser uploads candidate/submission folders."""
     with get_conn() as conn:
         existing = conn.execute("SELECT id FROM candidates WHERE id = ?", (cid,)).fetchone()
         if not existing:
@@ -1593,8 +1875,30 @@ def update_candidate_sharepoint_sync(cid: str, data: SharePointSyncIn):
                 cid,
             ),
         )
+
+        if data.submission_number is not None:
+            conn.execute(
+                """
+                UPDATE candidate_submissions
+                SET sharepoint_folder_id = ?,
+                    sharepoint_folder_url = ?,
+                    sharepoint_folder_path = ?,
+                    sharepoint_sync_status = ?,
+                    updated_at = datetime('now')
+                WHERE candidate_id = ? AND submission_number = ?
+                """,
+                (
+                    data.submission_folder_id or data.folder_id or "",
+                    data.submission_folder_url or data.folder_url or "",
+                    data.submission_folder_path or data.folder_path or "",
+                    data.status or "Synced",
+                    cid,
+                    data.submission_number,
+                ),
+            )
+
         row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
-  
+
     return row_to_dict(row)
 
 
@@ -1610,9 +1914,43 @@ def get_candidate(cid: str):
 
 @app.put("/api/candidates/{cid}", response_model=CandidateOut)
 def update_candidate(cid: str, data: CandidateIn):
-    """Update a candidate, preserving existing values when submitted fields are empty."""
+    """Update a candidate and record the website edit as a new version."""
     with get_conn() as conn:
-        return update_candidate_record(conn, cid, data, preserve_existing_values=False)
+        before_row = conn.execute(
+            "SELECT * FROM candidates WHERE id = ?",
+            (cid,),
+        ).fetchone()
+
+        if not before_row:
+            raise HTTPException(404, "Candidate not found")
+
+        before = candidate_snapshot(row_to_dict(before_row))
+
+        result = update_candidate_record(
+            conn,
+            cid,
+            data,
+            preserve_existing_values=False,
+        )
+
+        after_row = conn.execute(
+            "SELECT * FROM candidates WHERE id = ?",
+            (cid,),
+        ).fetchone()
+        after = candidate_snapshot(row_to_dict(after_row))
+
+        record_candidate_version(
+            conn,
+            candidate_id=cid,
+            source="website",
+            action="website_update",
+            before=before,
+            incoming=normalise_candidate_payload(data),
+            after=after,
+            changed_by="Website user",
+        )
+
+        return result
 
 
 @app.delete("/api/candidates/{cid}", status_code=204)
@@ -1623,6 +1961,89 @@ def delete_candidate(cid: str):
         if not existing:
             raise HTTPException(404, "Candidate not found")
         conn.execute("DELETE FROM candidates WHERE id = ?", (cid,))
+
+@app.get("/api/candidates/{cid}/versions")
+def get_candidate_versions(cid: str):
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM candidate_versions
+            WHERE candidate_id = ?
+            ORDER BY version_number ASC
+            """,
+            (cid,),
+        ).fetchall()
+
+    versions = []
+    for row in rows:
+        item = row_to_dict(row)
+        item["before_json"] = json.loads(item.get("before_json") or "{}")
+        item["incoming_json"] = json.loads(item.get("incoming_json") or "{}")
+        item["after_json"] = json.loads(item.get("after_json") or "{}")
+        item["diff_json"] = json.loads(item.get("diff_json") or "{}")
+        versions.append(item)
+
+    return {
+        "candidate_id": cid,
+        "versions": versions,
+    }
+
+@app.get("/api/candidates/{cid}/submissions")
+def get_candidate_submissions(cid: str):
+    """Return all saved submission versions for a candidate with file metadata."""
+    with get_conn() as conn:
+        candidate_row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
+        if not candidate_row:
+            raise HTTPException(404, "Candidate not found")
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM candidate_submissions
+            WHERE candidate_id = ?
+            ORDER BY submission_number ASC
+            """,
+            (cid,),
+        ).fetchall()
+
+    candidate = row_to_dict(candidate_row)
+    candidate_folder = candidate.get("local_folder_path") or candidate_local_folder(cid, candidate.get("name"))
+    candidate_folder_basename = os.path.basename(candidate_folder.rstrip("/\\")) or candidate_folder_name(cid, candidate.get("name"))
+
+    submissions = []
+    for row in rows:
+        item = row_to_dict(row)
+        local_folder = item.get("local_folder_path") or ""
+        folder_exists = bool(local_folder and os.path.isdir(local_folder))
+        manifest = load_local_documents_manifest(local_folder) if folder_exists else {"files": [], "errors": []}
+        file_count = 0
+        if folder_exists:
+            file_count = len([
+                name for name in os.listdir(local_folder)
+                if os.path.isfile(os.path.join(local_folder, name)) and name != "documents_manifest.json"
+            ])
+
+        submission_number = int(item.get("submission_number") or 0)
+        item.update({
+            "display_name": submission_display_name(submission_number),
+            "candidate_folder_name": candidate_folder_basename,
+            "submission_folder_name": os.path.basename(local_folder.rstrip("/\\")) or submission_folder_name(submission_number, item.get("jotform_submission_id")),
+            "folder_exists": folder_exists,
+            "file_count": file_count,
+            "errors": manifest.get("errors") or [],
+            "files_url": f"/api/candidates/{cid}/local-files?submission_number={submission_number}",
+        })
+        submissions.append(item)
+
+    return {
+        "candidate_id": cid,
+        "candidate_name": candidate.get("name") or "",
+        "candidate_folder_name": candidate_folder_basename,
+        "sharepoint_folder_url": candidate.get("sharepoint_folder_url") or "",
+        "submissions": submissions,
+    }
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # API ROUTES - STATISTICS / HEALTH
