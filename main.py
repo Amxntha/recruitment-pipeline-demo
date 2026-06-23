@@ -294,6 +294,8 @@ def init_db() -> None:
                 submission_number INTEGER NOT NULL,
                 jotform_form_id TEXT,
                 jotform_submission_id TEXT,
+                submission_date TEXT,
+                submitted_name TEXT,
                 local_folder_path TEXT,
                 storage_status TEXT,
                 sharepoint_sync_status TEXT,
@@ -308,6 +310,8 @@ def init_db() -> None:
 
         submission_cols = get_existing_columns(conn, "candidate_submissions")
         for column in [
+            "submission_date",
+            "submitted_name",
             "sharepoint_sync_status",
             "sharepoint_folder_id",
             "sharepoint_folder_url",
@@ -645,6 +649,10 @@ def update_candidate_record(
 def normalise_email(email: Optional[str]) -> str:
     return (email or "").strip().lower()
 
+
+def normalise_name_for_compare(name: Optional[str]) -> str:
+    return re.sub(r"\s+", " ", (name or "").strip().lower())
+
 def find_existing_candidate(
     conn: sqlite3.Connection,
     email: str,
@@ -882,6 +890,11 @@ def sanitize_filename(name: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._-")
     return cleaned or "submission"
 
+def sanitize_email_folder_name(email: str) -> str:
+    """Create a folder name from an email while keeping the @ symbol."""
+    cleaned = normalise_email(email)
+    cleaned = re.sub(r"[^A-Za-z0-9._@+-]+", "_", cleaned).strip("._-")
+    return cleaned or "candidate"
 
 
 def jotform_api_get(path: str, params: Optional[dict] = None) -> dict:
@@ -1324,20 +1337,19 @@ def build_submission_summary(full_name: str, fields: dict, document_urls: dict) 
     return "\n".join(summary_lines) + "\n"
 
 
-def candidate_folder_name(cid: str, full_name: Optional[str] = None) -> str:
-    """Return the folder name used for both local storage and SharePoint."""
-    safe_id = sanitize_filename(cid)
-    safe_name = sanitize_filename(full_name or "")
+def candidate_folder_name(cid: str, email: Optional[str] = None) -> str:
+    """Return the folder name used for local storage and SharePoint."""
+    cleaned_email = normalise_email(email)
 
-    if safe_name:
-        return f"{safe_name}_{safe_id}"
+    if cleaned_email:
+        return sanitize_email_folder_name(cleaned_email)
 
-    return safe_id
+    return sanitize_filename(cid)
 
 
-def candidate_local_folder(cid: str, full_name: Optional[str] = None) -> str:
+def candidate_local_folder(cid: str, email: Optional[str] = None) -> str:
     """Return the local storage folder for a candidate."""
-    return os.path.join(STORAGE_ROOT, candidate_folder_name(cid, full_name))
+    return os.path.join(STORAGE_ROOT, candidate_folder_name(cid, email))
 
 
 def submission_folder_name(submission_number: int, submission_id: Optional[str] = None) -> str:
@@ -1378,34 +1390,86 @@ def get_candidate_submission_row(
     ).fetchone()
 
 
+
+
+def saved_document_filename(candidate_name: str, document_label: str, uploaded_date: Optional[str], extension: str) -> str:
+    """Return a readable saved filename: name_document_uploaded-date.ext."""
+    safe_name = sanitize_filename(candidate_name or "candidate")
+    safe_label = sanitize_filename(document_label or "document")
+    safe_date = sanitize_filename(uploaded_date or datetime.now().strftime("%Y-%m-%d"))
+    return f"{safe_name}_{safe_label}_{safe_date}{extension}"
+
+
+def submission_manifest_filename(submission_number: Optional[int]) -> str:
+    """Return the per-submission manifest file stored inside the candidate folder."""
+    if submission_number:
+        return f"documents_manifest_submission_{int(submission_number):03d}.json"
+    return "documents_manifest.json"
+
+
+def submission_details_filename(submission_number: Optional[int]) -> str:
+    """Return the per-submission summary filename stored inside the candidate folder."""
+    if submission_number:
+        return f"submission_{int(submission_number):03d}_details.txt"
+    return "submission_details.txt"
+
+
+def unique_filename_in_folder(folder: str, filename: str) -> str:
+    """Avoid overwriting an earlier submission file with the same generated name."""
+    base, ext = os.path.splitext(filename)
+    candidate = filename
+    counter = 2
+    while os.path.exists(os.path.join(folder, candidate)):
+        candidate = f"{base}_{counter}{ext}"
+        counter += 1
+    return candidate
+
+
+def load_json_file(path: str, fallback: dict) -> dict:
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+    except Exception as exc:
+        print(f"[STORAGE DEBUG] Could not read JSON file {path}: {exc}")
+    return fallback
+
+
 def save_local_submission_files(
     local_folder: str,
     summary_text: str,
     document_urls: dict,
+    *,
+    candidate_name: str = "",
+    uploaded_date: Optional[str] = None,
+    submission_number: Optional[int] = None,
     jotform_context: Optional[dict] = None,
 ) -> dict:
-    """Save submission details and validated documents to local storage.
+    """Save submission details and validated documents to one email-based candidate folder.
 
-    The saved local files become the single reliable source used by the site
-    preview and by browser-based SharePoint sync. JotForm URLs are treated only
-    as temporary source links used during webhook processing.
+    The folder is shared by all submissions for the same email. Per-submission
+    manifests preserve the timeline/latest-submission UI without creating
+    Submission_001 / Submission_002 subfolders.
     """
     os.makedirs(local_folder, exist_ok=True)
-    info_path = os.path.join(local_folder, "submission_details.txt")
+    details_name = submission_details_filename(submission_number)
+    info_path = os.path.join(local_folder, details_name)
 
     with open(info_path, "w", encoding="utf-8") as handle:
         handle.write(summary_text)
 
-    saved_files = ["submission_details.txt"]
+    saved_files = [details_name]
     manifest = [
         {
             "document_key": "submission_details",
             "label": "Submission details",
-            "filename": "submission_details.txt",
+            "filename": details_name,
             "content_type": "text/plain",
             "detected_type": "Text file",
             "previewable": True,
             "size_bytes": os.path.getsize(info_path),
+            "submission_number": submission_number,
+            "uploaded_date": uploaded_date or "",
         }
     ]
     errors = []
@@ -1424,7 +1488,8 @@ def save_local_submission_files(
                 jotform_context=jotform_context,
             )
             extension = downloaded["extension"]
-            filename = f"{sanitize_filename(document_key)}{extension}"
+            filename = saved_document_filename(candidate_name, label, uploaded_date, extension)
+            filename = unique_filename_in_folder(local_folder, filename)
             file_path = os.path.join(local_folder, filename)
 
             with open(file_path, "wb") as handle:
@@ -1439,6 +1504,8 @@ def save_local_submission_files(
                 "previewable": downloaded["previewable"],
                 "size_bytes": os.path.getsize(file_path),
                 "download_source": downloaded.get("download_source", "webhook_url"),
+                "submission_number": submission_number,
+                "uploaded_date": uploaded_date or "",
             }
             manifest.append(file_info)
             saved_files.append(filename)
@@ -1451,34 +1518,46 @@ def save_local_submission_files(
                 "source_url_present": True,
                 "fallback_attempted": isinstance(exc, FileDownloadError) and exc.returned_html,
                 "error": str(exc),
+                "submission_number": submission_number,
+                "uploaded_date": uploaded_date or "",
             }
             errors.append(error)
             print(f"[STORAGE DEBUG] Failed to save local file {label}: {exc}")
 
-    manifest_path = os.path.join(local_folder, "documents_manifest.json")
-    with open(manifest_path, "w", encoding="utf-8") as handle:
-        json.dump({"files": manifest, "errors": errors}, handle, indent=2)
-
     if errors:
-        error_path = os.path.join(local_folder, "download_errors.txt")
+        error_name = f"download_errors_submission_{int(submission_number or 0):03d}.txt" if submission_number else "download_errors.txt"
+        error_path = os.path.join(local_folder, error_name)
         with open(error_path, "w", encoding="utf-8") as handle:
             handle.write("Some JotForm files could not be downloaded or validated.\n\n")
             for error in errors:
                 handle.write(f"- {error['label']}: {error['error']}\n")
-        saved_files.append("download_errors.txt")
+        saved_files.append(error_name)
         manifest.append({
             "document_key": "download_errors",
             "label": "Download errors",
-            "filename": "download_errors.txt",
+            "filename": error_name,
             "content_type": "text/plain",
             "detected_type": "Text file",
             "previewable": True,
             "size_bytes": os.path.getsize(error_path),
+            "submission_number": submission_number,
+            "uploaded_date": uploaded_date or "",
         })
 
-        # Rewrite manifest so it includes the error file entry as well.
-        with open(manifest_path, "w", encoding="utf-8") as handle:
-            json.dump({"files": manifest, "errors": errors}, handle, indent=2)
+    manifest_filename = submission_manifest_filename(submission_number)
+    manifest_path = os.path.join(local_folder, manifest_filename)
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump({"files": manifest, "errors": errors}, handle, indent=2)
+
+    # Maintain an aggregate manifest for inspection/debugging while the website
+    # reads the per-submission manifest to keep timeline grouping accurate.
+    aggregate_path = os.path.join(local_folder, "documents_manifest.json")
+    aggregate = load_json_file(aggregate_path, {"files": [], "errors": []})
+    aggregate_files = [item for item in aggregate.get("files", []) if item.get("filename") not in {m.get("filename") for m in manifest}]
+    aggregate_files.extend(manifest)
+    aggregate_errors = aggregate.get("errors", []) + errors
+    with open(aggregate_path, "w", encoding="utf-8") as handle:
+        json.dump({"files": aggregate_files, "errors": aggregate_errors}, handle, indent=2)
 
     return {
         "storage_type": "local",
@@ -1486,21 +1565,104 @@ def save_local_submission_files(
         "files": saved_files,
         "details_file": info_path,
         "manifest_file": manifest_path,
+        "aggregate_manifest_file": aggregate_path,
         "errors": errors,
     }
 
 
-def load_local_documents_manifest(local_folder: str) -> dict:
-    """Load local document metadata generated during webhook storage."""
-    manifest_path = os.path.join(local_folder, "documents_manifest.json")
-    if not os.path.isfile(manifest_path):
-        return {"files": [], "errors": []}
-    try:
-        with open(manifest_path, "r", encoding="utf-8") as handle:
-            return json.load(handle)
-    except Exception as exc:
-        print(f"[STORAGE DEBUG] Could not read documents manifest: {exc}")
-        return {"files": [], "errors": []}
+def load_local_documents_manifest(local_folder: str, submission_number: Optional[int] = None) -> dict:
+    """Load local document metadata generated during webhook storage.
+
+    If submission_number is provided, load that submission's manifest from the
+    shared email-based folder. Otherwise load the aggregate manifest.
+    """
+    manifest_path = os.path.join(local_folder, submission_manifest_filename(submission_number))
+    if not os.path.isfile(manifest_path) and submission_number is not None:
+        # Compatibility fallback for older databases that still point to a
+        # physical Submission_001 folder containing documents_manifest.json.
+        old_manifest_path = os.path.join(local_folder, "documents_manifest.json")
+        manifest_path = old_manifest_path
+    return load_json_file(manifest_path, {"files": [], "errors": []})
+
+
+def is_required_document_key(document_key: str) -> bool:
+    """Return True when a manifest item represents one required candidate document."""
+    return (document_key or "") in DOCUMENT_DISPLAY_LABELS
+
+
+def submission_uploaded_date(submission: Optional[dict]) -> str:
+    """Return the upload/submission date shown in the website document UI."""
+    if not submission:
+        return ""
+    return (
+        submission.get("submission_date")
+        or submission.get("created_at")
+        or ""
+    )
+
+
+def local_file_info_from_manifest(
+    *,
+    cid: str,
+    local_folder: str,
+    manifest_item: dict,
+    submission: dict,
+) -> Optional[dict]:
+    """Build website preview metadata for one saved local document."""
+    filename = manifest_item.get("filename") or ""
+    document_key = manifest_item.get("document_key") or ""
+
+    if not filename or not is_required_document_key(document_key):
+        return None
+
+    file_path = os.path.join(local_folder, filename)
+    if not os.path.isfile(file_path):
+        return None
+
+    content_type = manifest_item.get("content_type") or get_media_type_for_file(file_path)
+    submission_number = int(submission.get("submission_number") or 0)
+    preview_url = (
+        f"/api/candidates/{cid}/files/{quote(filename, safe='')}"
+        f"?submission_number={submission_number}"
+    )
+
+    return {
+        "document_key": document_key,
+        "label": manifest_item.get("label") or DOCUMENT_DISPLAY_LABELS.get(document_key, document_key.replace("_", " ").title()),
+        "filename": filename,
+        "content_type": content_type,
+        "detected_type": manifest_item.get("detected_type") or content_type,
+        "previewable": bool(manifest_item.get("previewable", content_type.startswith("image/") or content_type in {"application/pdf", "text/plain"})),
+        "size_bytes": os.path.getsize(file_path),
+        "preview_url": preview_url,
+        "download_url": preview_url,
+        "submission_number": submission_number,
+        "submission_display_name": submission_display_name(submission_number),
+        "uploaded_date": manifest_item.get("uploaded_date") or submission_uploaded_date(submission),
+        "sharepoint_folder_url": submission.get("sharepoint_folder_url") or "",
+    }
+
+
+def list_submission_document_files(cid: str, submission: dict) -> tuple[list[dict], list[dict], bool]:
+    """Return required document files for one submission based on its manifest."""
+    local_folder = submission.get("local_folder_path") or ""
+    folder_exists = bool(local_folder and os.path.isdir(local_folder))
+    if not folder_exists:
+        return [], [], False
+
+    manifest = load_local_documents_manifest(local_folder, submission.get("submission_number"))
+    files: list[dict] = []
+    for item in manifest.get("files") or []:
+        file_info = local_file_info_from_manifest(
+            cid=cid,
+            local_folder=local_folder,
+            manifest_item=item,
+            submission=submission,
+        )
+        if file_info:
+            files.append(file_info)
+
+    return files, manifest.get("errors") or [], True
 
 
 def save_candidate_submission(
@@ -1509,19 +1671,12 @@ def save_candidate_submission(
     document_urls: dict,
     jotform_context: Optional[dict] = None,
 ) -> None:
-    """Save each JotForm submission into its own versioned local folder."""
+    """Save each JotForm submission inside one email-based candidate folder."""
     with get_conn() as conn:
         submission_number = next_submission_number(conn, cid)
 
-    submission_id = (jotform_context or {}).get("submission_id") or "unknown"
-    safe_submission_id = sanitize_filename(str(submission_id))
-
-    candidate_folder = candidate_local_folder(cid, candidate.name)
-    local_folder = os.path.join(
-        candidate_folder,
-        "submissions",
-        submission_folder_name(submission_number, safe_submission_id),
-    )
+    candidate_folder = candidate_local_folder(cid, candidate.email)
+    local_folder = candidate_folder
 
     summary_text = build_submission_summary(
         candidate.name,
@@ -1546,7 +1701,10 @@ def save_candidate_submission(
         local_folder,
         summary_text,
         document_urls,
-        jotform_context,
+        candidate_name=candidate.name,
+        uploaded_date=candidate.date,
+        submission_number=submission_number,
+        jotform_context=jotform_context,
     )
 
     sync_status = "Pending browser sync"
@@ -1558,10 +1716,10 @@ def save_candidate_submission(
             """
             INSERT INTO candidate_submissions (
                 id, candidate_id, submission_number, jotform_form_id,
-                jotform_submission_id, local_folder_path, storage_status,
+                jotform_submission_id, submission_date, submitted_name, local_folder_path, storage_status,
                 sharepoint_sync_status, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             """,
             (
                 str(uuid.uuid4()),
@@ -1569,6 +1727,8 @@ def save_candidate_submission(
                 submission_number,
                 (jotform_context or {}).get("form_id", ""),
                 (jotform_context or {}).get("submission_id", ""),
+                candidate.date or "",
+                candidate.name or "",
                 local_folder,
                 sync_status,
                 sync_status,
@@ -1736,18 +1896,14 @@ def list_candidate_local_files(cid: str, submission_number: Optional[int] = None
         raise HTTPException(404, "Candidate not found")
 
     candidate = row_to_dict(candidate_row)
-    candidate_folder = candidate.get("local_folder_path") or candidate_local_folder(cid, candidate.get("name"))
-    candidate_folder_basename = os.path.basename(candidate_folder.rstrip("/\\")) or candidate_folder_name(cid, candidate.get("name"))
+    candidate_folder = candidate.get("local_folder_path") or candidate_local_folder(cid, candidate.get("email"))
+    candidate_folder_basename = os.path.basename(candidate_folder.rstrip("/\\")) or candidate_folder_name(cid, candidate.get("email"))
 
     if submission_row:
         submission = row_to_dict(submission_row)
         selected_submission_number = int(submission.get("submission_number") or 0)
-        local_folder = submission.get("local_folder_path") or os.path.join(
-            candidate_folder,
-            "submissions",
-            submission_folder_name(selected_submission_number, submission.get("jotform_submission_id")),
-        )
-        current_submission_folder_name = os.path.basename(local_folder.rstrip("/\\")) or submission_folder_name(selected_submission_number)
+        local_folder = submission.get("local_folder_path") or candidate_folder
+        current_submission_folder_name = ""
     else:
         submission = None
         selected_submission_number = None
@@ -1762,6 +1918,9 @@ def list_candidate_local_files(cid: str, submission_number: Optional[int] = None
             "folder_name": candidate_folder_basename,
             "submission_number": selected_submission_number,
             "submission_display_name": submission_display_name(selected_submission_number) if selected_submission_number else "Latest submission",
+            "submission_date": submission_uploaded_date(submission),
+            "uploaded_date": submission_uploaded_date(submission),
+            "submitted_name": (submission or {}).get("submitted_name") or "",
             "submission_folder_name": current_submission_folder_name,
             "folder_exists": False,
             "files": [],
@@ -1769,20 +1928,19 @@ def list_candidate_local_files(cid: str, submission_number: Optional[int] = None
             "message": "No local files were found for this submission.",
         }
 
-    manifest = load_local_documents_manifest(local_folder)
+    manifest = load_local_documents_manifest(local_folder, selected_submission_number)
     manifest_files = manifest.get("files") or []
-    manifest_by_name = {item.get("filename"): item for item in manifest_files if item.get("filename")}
 
     files = []
-    for filename in sorted(os.listdir(local_folder)):
-        if filename == "documents_manifest.json":
+    for metadata in manifest_files:
+        filename = metadata.get("filename") or ""
+        if not filename or filename.startswith("documents_manifest"):
             continue
 
         file_path = os.path.join(local_folder, filename)
         if not os.path.isfile(file_path):
             continue
 
-        metadata = manifest_by_name.get(filename, {})
         content_type = metadata.get("content_type") or get_media_type_for_file(file_path)
         with open(file_path, "rb") as handle:
             detected_type = detect_file_type(handle.read(512), content_type)["detected_type"]
@@ -1794,7 +1952,11 @@ def list_candidate_local_files(cid: str, submission_number: Optional[int] = None
             "detected_type": metadata.get("detected_type") or detected_type,
             "previewable": bool(metadata.get("previewable", content_type.startswith("image/") or content_type in {"application/pdf", "text/plain"})),
             "size_bytes": os.path.getsize(file_path),
+            "uploaded_date": metadata.get("uploaded_date") or submission_uploaded_date(submission),
+            "submission_number": selected_submission_number,
+            "submission_display_name": submission_display_name(selected_submission_number) if selected_submission_number else "Latest submission",
             "download_url": f"/api/candidates/{cid}/files/{quote(filename, safe='')}" + (f"?submission_number={selected_submission_number}" if selected_submission_number else ""),
+            "preview_url": f"/api/candidates/{cid}/files/{quote(filename, safe='')}" + (f"?submission_number={selected_submission_number}" if selected_submission_number else ""),
         })
 
     return {
@@ -1825,15 +1987,15 @@ def download_candidate_local_file(cid: str, filename: str, submission_number: Op
         raise HTTPException(400, "Invalid filename")
 
     with get_conn() as conn:
-        candidate_row = conn.execute("SELECT id, name, local_folder_path FROM candidates WHERE id = ?", (cid,)).fetchone()
+        candidate_row = conn.execute("SELECT id, name, email, local_folder_path FROM candidates WHERE id = ?", (cid,)).fetchone()
         submission_row = get_candidate_submission_row(conn, cid, submission_number)
 
     if not candidate_row:
         raise HTTPException(404, "Candidate not found")
 
-    candidate_folder = candidate_row["local_folder_path"] or candidate_local_folder(cid, candidate_row["name"])
+    candidate_folder = candidate_row["local_folder_path"] or candidate_local_folder(cid, candidate_row["email"])
     if submission_row:
-        local_folder = submission_row["local_folder_path"]
+        local_folder = submission_row["local_folder_path"] or candidate_folder
     else:
         local_folder = candidate_folder
 
@@ -2008,27 +2170,28 @@ def get_candidate_submissions(cid: str):
         ).fetchall()
 
     candidate = row_to_dict(candidate_row)
-    candidate_folder = candidate.get("local_folder_path") or candidate_local_folder(cid, candidate.get("name"))
-    candidate_folder_basename = os.path.basename(candidate_folder.rstrip("/\\")) or candidate_folder_name(cid, candidate.get("name"))
+    candidate_folder = candidate.get("local_folder_path") or candidate_local_folder(cid, candidate.get("email"))
+    candidate_folder_basename = os.path.basename(candidate_folder.rstrip("/\\")) or candidate_folder_name(cid, candidate.get("email"))
 
     submissions = []
     for row in rows:
         item = row_to_dict(row)
         local_folder = item.get("local_folder_path") or ""
         folder_exists = bool(local_folder and os.path.isdir(local_folder))
-        manifest = load_local_documents_manifest(local_folder) if folder_exists else {"files": [], "errors": []}
-        file_count = 0
-        if folder_exists:
-            file_count = len([
-                name for name in os.listdir(local_folder)
-                if os.path.isfile(os.path.join(local_folder, name)) and name != "documents_manifest.json"
-            ])
-
         submission_number = int(item.get("submission_number") or 0)
+        manifest = load_local_documents_manifest(local_folder, submission_number) if folder_exists else {"files": [], "errors": []}
+        file_count = len([
+            item for item in (manifest.get("files") or [])
+            if item.get("filename") and item.get("document_key") not in {"submission_details", "download_errors"}
+        ]) if folder_exists else 0
+
         item.update({
             "display_name": submission_display_name(submission_number),
+            "submission_date": item.get("submission_date") or item.get("created_at") or "",
+            "uploaded_date": item.get("submission_date") or item.get("created_at") or "",
+            "submitted_name": item.get("submitted_name") or "",
             "candidate_folder_name": candidate_folder_basename,
-            "submission_folder_name": os.path.basename(local_folder.rstrip("/\\")) or submission_folder_name(submission_number, item.get("jotform_submission_id")),
+            "submission_folder_name": "",
             "folder_exists": folder_exists,
             "file_count": file_count,
             "errors": manifest.get("errors") or [],
@@ -2042,6 +2205,111 @@ def get_candidate_submissions(cid: str):
         "candidate_folder_name": candidate_folder_basename,
         "sharepoint_folder_url": candidate.get("sharepoint_folder_url") or "",
         "submissions": submissions,
+    }
+
+
+@app.get("/api/candidates/{cid}/documents-view")
+def get_candidate_documents_view(cid: str):
+    """Return document data for the website Latest submissions and Timeline tabs.
+
+    Latest submissions contains the newest available file for each required
+    document type across all submissions. Timeline contains each submission with
+    only the documents provided in that submission.
+    """
+    with get_conn() as conn:
+        candidate_row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
+        if not candidate_row:
+            raise HTTPException(404, "Candidate not found")
+
+        submission_rows = conn.execute(
+            """
+            SELECT *
+            FROM candidate_submissions
+            WHERE candidate_id = ?
+            ORDER BY submission_number ASC
+            """,
+            (cid,),
+        ).fetchall()
+
+    candidate = row_to_dict(candidate_row)
+    latest_by_key: dict[str, dict] = {}
+    timeline_submissions: list[dict] = []
+
+    for row in submission_rows:
+        submission = row_to_dict(row)
+        submission_number = int(submission.get("submission_number") or 0)
+        files, errors, folder_exists = list_submission_document_files(cid, submission)
+
+        for file_info in files:
+            latest_by_key[file_info["document_key"]] = file_info
+
+        timeline_submissions.append({
+            "submission_number": submission_number,
+            "display_name": submission_display_name(submission_number),
+            "submission_date": submission_uploaded_date(submission),
+            "uploaded_date": submission_uploaded_date(submission),
+            "submitted_name": (submission or {}).get("submitted_name") or "",
+            "folder_exists": folder_exists,
+            "local_folder_path": submission.get("local_folder_path") or "",
+            "storage_status": submission.get("storage_status") or "",
+            "sharepoint_sync_status": submission.get("sharepoint_sync_status") or "",
+            "sharepoint_folder_url": submission.get("sharepoint_folder_url") or "",
+            "files": files,
+            "errors": errors,
+        })
+
+    latest_documents = []
+    for document_key, label in DOCUMENT_DISPLAY_LABELS.items():
+        file_info = latest_by_key.get(document_key)
+        if file_info:
+            latest_documents.append({
+                "document_key": document_key,
+                "label": label,
+                "status": "Provided",
+                **file_info,
+            })
+        else:
+            latest_documents.append({
+                "document_key": document_key,
+                "label": label,
+                "status": "Not provided",
+                "filename": "",
+                "content_type": "",
+                "detected_type": "",
+                "previewable": False,
+                "size_bytes": 0,
+                "preview_url": "",
+                "download_url": "",
+                "submission_number": None,
+                "submission_display_name": "",
+                "uploaded_date": "",
+                "sharepoint_folder_url": "",
+            })
+
+    current_name = candidate.get("name") or ""
+    current_name_norm = normalise_name_for_compare(current_name)
+    suggested_names = []
+    seen_names = set()
+    for submission in reversed(timeline_submissions):
+        submitted_name = (submission.get("submitted_name") or "").strip()
+        submitted_name_norm = normalise_name_for_compare(submitted_name)
+        if not submitted_name or submitted_name_norm == current_name_norm or submitted_name_norm in seen_names:
+            continue
+        seen_names.add(submitted_name_norm)
+        suggested_names.append({
+            "name": submitted_name,
+            "submitted_date": submission.get("submission_date") or submission.get("uploaded_date") or "",
+            "submission_number": submission.get("submission_number"),
+        })
+
+    return {
+        "candidate_id": cid,
+        "candidate_name": current_name,
+        "sharepoint_folder_url": candidate.get("sharepoint_folder_url") or "",
+        "suggested_names": suggested_names,
+        "latest_suggested_name": suggested_names[0] if suggested_names else None,
+        "latest_documents": latest_documents,
+        "timeline": timeline_submissions,
     }
 
 
@@ -2076,12 +2344,12 @@ def stats():
 def debug_local_file_types(cid: str):
     """Inspect actual local file bytes and media types for a candidate."""
     with get_conn() as conn:
-        row = conn.execute("SELECT name, local_folder_path FROM candidates WHERE id = ?", (cid,)).fetchone()
+        row = conn.execute("SELECT name, email, local_folder_path FROM candidates WHERE id = ?", (cid,)).fetchone()
 
     if not row:
         raise HTTPException(404, "Candidate not found")
 
-    local_folder = row["local_folder_path"] or candidate_local_folder(cid, row["name"])
+    local_folder = row["local_folder_path"] or candidate_local_folder(cid, row["email"])
     if not os.path.isdir(local_folder):
         raise HTTPException(404, "Local candidate folder not found")
 

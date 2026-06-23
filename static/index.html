@@ -182,6 +182,38 @@
   .local-doc-link:hover { text-decoration: underline; }
   .doc-error-list { color: #8B2020; background: #FDF2F2; border: 1px solid #E8BEBC; border-radius: 8px; padding: 10px 12px; margin-top: 12px; }
 
+  .doc-view-tabs { display: flex; gap: 8px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 6px; margin-bottom: 12px; }
+  .doc-view-tab { flex: 1; padding: 7px 8px; border-radius: 8px; border: none; background: transparent; color: var(--ink-muted); font-size: 12.5px; font-family: 'DM Sans', sans-serif; cursor: pointer; }
+  .doc-view-tab.active { background: var(--ink); color: var(--cream); }
+  .doc-latest-grid { display: grid; grid-template-columns: 1fr; gap: 10px; }
+  .doc-version-card { border: 1px solid var(--border); border-radius: 10px; background: var(--surface); padding: 11px 12px; }
+  .doc-version-card.provided { background: var(--surface-raised); }
+  .doc-version-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+  .doc-version-title { font-weight: 600; font-size: 13.5px; color: var(--ink); }
+  .doc-version-badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+  .doc-version-badge.provided { background: var(--teal-light); color: var(--teal); }
+  .doc-version-badge.missing { background: #F5E3E3; color: #B83232; }
+  .doc-version-meta { color: var(--ink-light); font-size: 12px; margin-top: 4px; }
+  .doc-preview-btn { margin-top: 8px; padding: 5px 9px; border-radius: 7px; border: 1px solid var(--border); background: var(--surface-raised); color: var(--accent); font-size: 12px; font-family: 'DM Sans', sans-serif; cursor: pointer; }
+  .doc-preview-btn:hover { background: var(--accent-light); border-color: var(--accent-light); }
+  .doc-preview-panel { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); padding: 12px; margin-top: 10px; margin-bottom: 0; }
+  .doc-preview-header { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; margin-bottom: 8px; }
+  .doc-preview-title { font-weight: 600; font-size: 13.5px; }
+  .doc-preview-frame { width: 100%; min-height: 260px; border: 1px solid var(--border); border-radius: 10px; background: white; }
+  .doc-preview-image { width: 100%; max-height: 300px; object-fit: contain; border: 1px solid var(--border); border-radius: 10px; background: white; }
+  .doc-timeline { display: flex; flex-direction: column; gap: 0; }
+  .doc-timeline-item { position: relative; padding-left: 24px; padding-bottom: 16px; }
+  .doc-timeline-item::before { content: ''; position: absolute; left: 5px; top: 7px; width: 11px; height: 11px; border-radius: 50%; background: var(--accent); }
+  .doc-timeline-item:not(:last-child)::after { content: ''; position: absolute; left: 10px; top: 18px; bottom: 0; width: 1.5px; background: var(--border); }
+  .doc-timeline-card { border: 1px solid var(--border); border-radius: 10px; background: var(--surface-raised); padding: 12px; }
+  .doc-timeline-title { font-weight: 600; font-size: 13.5px; }
+  .doc-timeline-docs { display: flex; flex-direction: column; gap: 8px; margin-top: 9px; }
+  .doc-chip-entry { display: block; }
+  .doc-chip { border: 1px solid var(--border); background: var(--surface); border-radius: 999px; padding: 5px 9px; font-size: 11.5px; color: var(--accent); cursor: pointer; }
+  .doc-chip:hover { background: var(--accent-light); }
+  .sharepoint-folder-link { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+  .suggested-name { margin-top: 4px; font-size: 12px; color: var(--accent); }
+
   /* Loading spinner */
   .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); border-top-color: white; border-radius: 50%; animation: spin 0.7s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -413,7 +445,7 @@
   <div class="detail-header">
     <div class="detail-avatar-row">
       <div class="detail-avatar" id="dp-avatar"></div>
-      <div><div class="detail-name" id="dp-name"></div><div class="detail-role-tag" id="dp-role"></div></div>
+      <div><div class="detail-name" id="dp-name"></div><div class="suggested-name" id="dp-suggested-name"></div><div class="detail-role-tag" id="dp-role"></div></div>
     </div>
     <div id="dp-stage-badge"></div>
   </div>
@@ -448,6 +480,9 @@ let candidates = [];
 let editingId = null;
 let currentDetailId = null;
 let currentDetailReferenceEntries = [];
+let currentDocumentsViewData = null;
+let currentDocumentTab = 'latest';
+let currentPreviewFiles = {};
 let activeStage = 'All';
 let activeRole = 'All';
 let searchQuery = '';
@@ -514,26 +549,111 @@ function formatBytes(bytes) {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function localDocumentHtml(fileInfo) {
-  const url = fileInfo.download_url;
-  const label = fileInfo.label || fileInfo.filename;
-  const filename = fileInfo.filename || '';
-  const contentType = (fileInfo.content_type || '').toLowerCase();
-  const detectedType = fileInfo.detected_type || contentType || 'Saved file';
-  const meta = `${esc(filename)} • ${esc(detectedType)} • ${formatBytes(fileInfo.size_bytes)}`;
+function formatUploadDate(value) {
+  if (!value) return '—';
+  const raw = String(value).trim();
+  const datePart = raw.includes(' ') ? raw.split(' ')[0] : raw;
+  const dt = new Date(datePart + 'T00:00:00');
+  if (Number.isNaN(dt.getTime())) return raw;
+  return dt.toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+function registerPreviewFile(fileInfo) {
+  const id = 'doc_' + Math.random().toString(36).slice(2);
+  currentPreviewFiles[id] = fileInfo;
+  return id;
+}
+
+function buildDocumentPreviewHtml(fileId, fileInfo) {
+  const url = fileInfo.preview_url || fileInfo.download_url || '';
+  const label = fileInfo.label || fileInfo.filename || 'Document';
+  const contentType = String(fileInfo.content_type || '').toLowerCase();
+  const uploaded = fileInfo.uploaded_date ? `Uploaded: ${formatUploadDate(fileInfo.uploaded_date)}` : 'Uploaded: —';
+  const source = fileInfo.submission_number ? `From: Submission ${esc(fileInfo.submission_number)}` : '';
 
   let preview = '';
-  if (contentType.startsWith('image/')) {
-    preview = `<div class="doc-image-wrap"><a href="${esc(url)}" target="_blank" rel="noreferrer" title="Open full file"><img class="doc-image" src="${esc(url)}" alt="${esc(label)}"></a></div>`;
-  } else if (contentType === 'application/pdf') {
-    preview = `<a class="local-doc-link" href="${esc(url)}" target="_blank" rel="noreferrer">Open PDF</a>`;
-  } else if (contentType.startsWith('text/')) {
-    preview = `<a class="local-doc-link" href="${esc(url)}" target="_blank" rel="noreferrer">Open text file</a>`;
+  if (!url || !fileInfo.previewable) {
+    preview = '<div class="local-doc-meta">Preview is not available for this file type.</div>';
+  } else if (contentType.startsWith('image/')) {
+    preview = `<img class="doc-preview-image" src="${esc(url)}" alt="${esc(label)}">`;
+  } else if (contentType === 'application/pdf' || contentType.startsWith('text/')) {
+    preview = `<iframe class="doc-preview-frame" src="${esc(url)}" title="${esc(label)}"></iframe>`;
   } else {
-    preview = `<a class="local-doc-link" href="${esc(url)}" target="_blank" rel="noreferrer">Download file</a>`;
+    preview = '<div class="local-doc-meta">Preview is not available for this file type.</div>';
   }
 
-  return `<div class="local-doc-item"><strong>${esc(label)}</strong><div class="local-doc-meta">${meta}</div>${preview}</div>`;
+  return `
+    <div class="doc-preview-header">
+      <div>
+        <div class="doc-preview-title">${esc(label)}</div>
+        <div class="doc-version-meta">${uploaded}${source ? ' • ' + source : ''}</div>
+      </div>
+      <button class="close-btn" onclick="closeCandidateDocumentPreview('${fileId}')" title="Close preview">×</button>
+    </div>
+    ${preview}
+  `;
+}
+
+function previewCandidateDocument(fileId) {
+  const fileInfo = currentPreviewFiles[fileId];
+  const panel = document.getElementById(`document-preview-${fileId}`);
+  if (!fileInfo || !panel) return;
+
+  panel.innerHTML = buildDocumentPreviewHtml(fileId, fileInfo);
+  panel.style.display = 'block';
+}
+
+function closeCandidateDocumentPreview(fileId) {
+  const panel = document.getElementById(`document-preview-${fileId}`);
+  if (panel) {
+    panel.innerHTML = '';
+    panel.style.display = 'none';
+  }
+}
+
+function closeAllCandidateDocumentPreviews() {
+  document.querySelectorAll('.doc-preview-panel').forEach(panel => {
+    panel.innerHTML = '';
+    panel.style.display = 'none';
+  });
+}
+
+function documentCardHtml(fileInfo, mode) {
+  const provided = String(fileInfo.status || '').toLowerCase() === 'provided' || Boolean(fileInfo.preview_url || fileInfo.download_url);
+  const label = fileInfo.label || fileInfo.document_key || 'Document';
+
+  if (!provided) {
+    return `
+      <div class="doc-version-card">
+        <div class="doc-version-top">
+          <div class="doc-version-title">${esc(label)}</div>
+          <span class="doc-version-badge missing">Not provided</span>
+        </div>
+        <div class="doc-version-meta">Not provided in any submission</div>
+      </div>
+    `;
+  }
+
+  const fileId = registerPreviewFile(fileInfo);
+  const uploaded = fileInfo.uploaded_date ? formatUploadDate(fileInfo.uploaded_date) : '—';
+  const source = fileInfo.submission_number ? `Submission ${fileInfo.submission_number}` : 'Saved submission';
+  const filename = fileInfo.filename || '';
+  const sourceText = mode === 'latest' ? `Latest from ${source}` : source;
+
+  return `
+    <div class="doc-version-card provided">
+      <div class="doc-version-top">
+        <div>
+          <div class="doc-version-title">${esc(label)}</div>
+          <div class="doc-version-meta">${esc(filename)}</div>
+        </div>
+        <span class="doc-version-badge provided">Provided</span>
+      </div>
+      <div class="doc-version-meta">Uploaded: ${esc(uploaded)} • ${esc(sourceText)}</div>
+      <button class="doc-preview-btn" onclick="previewCandidateDocument('${fileId}')">Preview</button>
+      <div id="document-preview-${fileId}" class="doc-preview-panel" style="display:none;"></div>
+    </div>
+  `;
 }
 
 function referenceSectionHtml(referenceEntries) {
@@ -541,104 +661,125 @@ function referenceSectionHtml(referenceEntries) {
   return `<div style="margin-top:14px; font-weight:600;">References</div>${referenceEntries.join('<br><br>')}`;
 }
 
-async function renderSubmissionDocuments(candidate, submissionNumber, referenceEntries = []) {
-  const body = document.getElementById('submission-documents-body');
-  if (!body) return;
+function renderLatestSubmissionsTab() {
+  const content = document.getElementById('documents-version-content');
+  if (!content || !currentDocumentsViewData) return;
+  closeCandidateDocumentPreview();
+  currentPreviewFiles = {};
+  const documents = currentDocumentsViewData.latest_documents || [];
+  content.innerHTML = `
+    <div class="local-doc-meta" style="margin-bottom:10px;">Showing the latest available file for each required document type across all submissions.</div>
+    <div class="doc-latest-grid">
+      ${documents.map(doc => documentCardHtml(doc, 'latest')).join('')}
+    </div>
+  `;
+}
 
-  body.innerHTML = 'Loading selected submission documents…';
+function renderTimelineTab() {
+  const content = document.getElementById('documents-version-content');
+  if (!content || !currentDocumentsViewData) return;
+  closeCandidateDocumentPreview();
+  currentPreviewFiles = {};
+  const timeline = currentDocumentsViewData.timeline || [];
 
-  try {
-    const localInfo = await apiFetch(`/candidates/${candidate.id}/local-files?submission_number=${encodeURIComponent(submissionNumber)}`);
-    const entries = [];
+  if (!timeline.length) {
+    content.innerHTML = '<div>No saved submission timeline was found for this candidate.</div>';
+    return;
+  }
 
-    if (localInfo.folder_exists && localInfo.files && localInfo.files.length) {
-      entries.push(...localInfo.files.map(localDocumentHtml));
-    } else {
-      entries.push('<div>No saved local documents were found for this submission.</div>');
-    }
+  content.innerHTML = `
+    <div class="local-doc-meta" style="margin-bottom:10px;">Click any document in the timeline to preview what was uploaded in that submission.</div>
+    <div class="doc-timeline">
+      ${timeline.slice().reverse().map(sub => {
+        const docs = sub.files || [];
+        const date = sub.submission_date ? formatUploadDate(sub.submission_date) : '—';
+        const chips = docs.length
+          ? docs.map(doc => {
+              const fileId = registerPreviewFile(doc);
+              return `<div class="doc-chip-entry"><button class="doc-chip" onclick="previewCandidateDocument('${fileId}')">${esc(doc.label || doc.filename)}</button><div id="document-preview-${fileId}" class="doc-preview-panel" style="display:none;"></div></div>`;
+            }).join('')
+          : '<span class="local-doc-meta">No documents were saved for this submission.</span>';
+        const errors = sub.errors && sub.errors.length
+          ? `<div class="doc-error-list" style="margin-top:10px;"><strong>Files that could not be saved</strong><ul style="margin-left:18px; margin-top:6px;">${sub.errors.map(e => `<li><strong>${esc(e.label || e.document_key || 'File')}</strong>: ${esc(e.error || 'Failed to download')}</li>`).join('')}</ul></div>`
+          : '';
+        return `
+          <div class="doc-timeline-item">
+            <div class="doc-timeline-card">
+              <div class="doc-timeline-title">${esc(sub.display_name || ('Submission ' + sub.submission_number))}</div>
+              <div class="doc-version-meta">Submitted: ${esc(date)} • ${esc(docs.length)} document(s)</div>
+              <div class="doc-timeline-docs">${chips}</div>
+              ${errors}
+            </div>
+          </div>
+        `;
+      }).join('')}
+    </div>
+  `;
+}
 
-    if (localInfo.sharepoint_folder_url) {
-      entries.push(`<div style="margin-top:14px;"><strong>SharePoint submission folder:</strong> <a href="${esc(localInfo.sharepoint_folder_url)}" target="_blank" rel="noreferrer">Open selected submission</a></div>`);
-    }
+function renderCandidateDocumentTab(tabName) {
+  currentDocumentTab = tabName;
+  document.querySelectorAll('.doc-view-tab').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.docTab === tabName);
+  });
 
-    if (candidate.sharepoint_folder_url) {
-      entries.push(`<div><strong>SharePoint candidate folder:</strong> <a href="${esc(candidate.sharepoint_folder_url)}" target="_blank" rel="noreferrer">Open all submissions</a></div>`);
-    }
+  if (tabName === 'timeline') {
+    renderTimelineTab();
+  } else {
+    renderLatestSubmissionsTab();
+  }
+}
 
-    if (localInfo.errors && localInfo.errors.length) {
-      const errors = localInfo.errors.map(e => `<li><strong>${esc(e.label || e.document_key || 'File')}</strong>: ${esc(e.error || 'Failed to download')}</li>`).join('');
-      entries.push(`<div class="doc-error-list"><strong>Files that could not be saved</strong><ul style="margin-left:18px; margin-top:6px;">${errors}</ul></div>`);
-    }
+function sharePointFolderLinkHtml(candidate, documentsData) {
+  const url = (documentsData && documentsData.sharepoint_folder_url) || candidate.sharepoint_folder_url || '';
+  if (!url) return '';
+  return `<div class="sharepoint-folder-link"><strong>SharePoint candidate folder:</strong> <a href="${esc(url)}" target="_blank" rel="noreferrer">Open candidate folder</a></div>`;
+}
 
-    const refs = referenceSectionHtml(referenceEntries);
-    if (refs) entries.push(refs);
-
-    body.innerHTML = entries.join('') || 'No uploaded document details available.';
-  } catch (e) {
-    const refs = referenceSectionHtml(referenceEntries);
-    body.innerHTML = `Could not load selected submission documents: ${esc(e.message)}${refs ? '<br><br>' + refs : ''}`;
+function renderSuggestedCandidateName(documentsData) {
+  const el = document.getElementById('dp-suggested-name');
+  if (!el) return;
+  const suggestion = documentsData && documentsData.latest_suggested_name;
+  if (suggestion && suggestion.name) {
+    const date = suggestion.submitted_date ? formatUploadDate(suggestion.submitted_date) : 'unknown date';
+    el.textContent = `Suggested name: ${suggestion.name} from ${date}`;
+    el.style.display = 'block';
+  } else {
+    el.textContent = '';
+    el.style.display = 'none';
   }
 }
 
 async function renderCandidateSavedDocuments(candidate, referenceEntries = []) {
   const target = document.getElementById('dp-documents');
   currentDetailReferenceEntries = referenceEntries;
-  target.innerHTML = 'Loading saved submission versions…';
+  currentDocumentTab = 'latest';
+  currentPreviewFiles = {};
+  target.innerHTML = 'Loading candidate documents…';
 
   try {
-    const info = await apiFetch(`/candidates/${candidate.id}/submissions`);
-    const submissions = info.submissions || [];
-
-    if (!submissions.length) {
-      target.innerHTML = '<div>No saved submissions were found for this candidate.</div>' + referenceSectionHtml(referenceEntries);
-      return;
-    }
-
-    const latest = submissions[submissions.length - 1];
-    const options = submissions.map(s => {
-      const status = s.sharepoint_sync_status || s.storage_status || 'Saved locally';
-      const label = `${s.display_name || ('Submission ' + s.submission_number)} — ${status}`;
-      const selected = s.submission_number === latest.submission_number ? 'selected' : '';
-      return `<option value="${esc(s.submission_number)}" ${selected}>${esc(label)}</option>`;
-    }).join('');
-
-    const versionRows = submissions.map(s => {
-      const sp = s.sharepoint_folder_url
-        ? `<a href="${esc(s.sharepoint_folder_url)}" target="_blank" rel="noreferrer">SharePoint</a>`
-        : 'Local only';
-      const created = s.created_at ? ` • ${esc(s.created_at)}` : '';
-      return `<div class="local-doc-meta">${esc(s.display_name || ('Submission ' + s.submission_number))}: ${esc(s.file_count || 0)} file(s) • ${esc(s.storage_status || '')} • ${sp}${created}</div>`;
-    }).join('');
+    const data = await apiFetch(`/candidates/${candidate.id}/documents-view`);
+    currentDocumentsViewData = data;
+    renderSuggestedCandidateName(data);
 
     target.innerHTML = `
-      <div class="field" style="margin-bottom:12px;">
-        <label>Select submission version</label>
-        <select id="submission-version-select" onchange="renderSubmissionDocumentsBySelection()">
-          ${options}
-        </select>
+      <div class="doc-view-tabs">
+        <button class="doc-view-tab active" data-doc-tab="latest" onclick="renderCandidateDocumentTab('latest')">Latest submissions</button>
+        <button class="doc-view-tab" data-doc-tab="timeline" onclick="renderCandidateDocumentTab('timeline')">Timeline</button>
       </div>
-      <div style="margin-bottom:12px;">
-        <strong>Submission versions</strong>
-        ${versionRows}
-      </div>
-      <div id="submission-documents-body">Loading selected submission…</div>
+      <div id="documents-version-content"></div>
+      ${sharePointFolderLinkHtml(candidate, data)}
+      ${referenceSectionHtml(referenceEntries)}
       <div id="candidate-change-history" style="margin-top:16px;"></div>
     `;
 
-    await renderSubmissionDocuments(candidate, latest.submission_number, referenceEntries);
+    renderLatestSubmissionsTab();
     await renderCandidateChangeHistory(candidate.id);
   } catch (e) {
+    renderSuggestedCandidateName(null);
     const refs = referenceSectionHtml(referenceEntries);
-    target.innerHTML = `Could not load submission versions: ${esc(e.message)}${refs ? '<br><br>' + refs : ''}`;
+    target.innerHTML = `Could not load candidate document timeline: ${esc(e.message)}${refs ? '<br><br>' + refs : ''}`;
   }
-}
-
-async function renderSubmissionDocumentsBySelection() {
-  if (!currentDetailId) return;
-  const c = candidates.find(x => x.id === currentDetailId);
-  const select = document.getElementById('submission-version-select');
-  if (!c || !select) return;
-  await renderSubmissionDocuments(c, select.value, currentDetailReferenceEntries);
 }
 
 async function renderCandidateChangeHistory(candidateId) {
@@ -1268,19 +1409,19 @@ async function syncCandidateToSharePoint(candidateId, options = {}) {
 
   for (const submission of pendingSubmissions) {
     try {
-      const submissionFolderName = submission.submission_folder_name || `Submission_${String(submission.submission_number).padStart(3, '0')}`;
-      const submissionFolder = await ensureSharePointChildFolder(candidateFolder.id, submissionFolderName, options);
-      const submissionFolderPath = [candidateFolderPath, submissionFolderName].filter(Boolean).join('/');
       const localInfo = await apiFetch(`/candidates/${candidateId}/local-files?submission_number=${encodeURIComponent(submission.submission_number)}`);
 
       if (!localInfo.folder_exists || !localInfo.files.length) {
-        throw new Error(`No files found for ${submission.display_name || submissionFolderName}`);
+        throw new Error(`No files found for ${submission.display_name || ('Submission ' + submission.submission_number)}`);
       }
 
       const failedFiles = [];
       for (const fileInfo of localInfo.files) {
         try {
-          await uploadLocalFileToSharePoint(submissionFolder.id, fileInfo, options);
+          // All submission files are uploaded directly into the one email-based
+          // candidate folder. The filename carries the document label/date,
+          // while the database keeps the submission timeline metadata.
+          await uploadLocalFileToSharePoint(candidateFolder.id, fileInfo, options);
         } catch (error) {
           failedFiles.push({ filename: fileInfo.filename, error: error.message || String(error) });
         }
@@ -1298,14 +1439,14 @@ async function syncCandidateToSharePoint(candidateId, options = {}) {
           folder_path: candidateFolderPath,
           status,
           submission_number: submission.submission_number,
-          submission_folder_id: submissionFolder.id,
-          submission_folder_url: submissionFolder.webUrl,
-          submission_folder_path: submissionFolderPath
+          submission_folder_id: candidateFolder.id,
+          submission_folder_url: candidateFolder.webUrl,
+          submission_folder_path: candidateFolderPath
         })
       });
 
       if (failedFiles.length) {
-        throw new Error(`${submission.display_name || submissionFolderName}: ${failedFiles.length} file(s) failed to upload.`);
+        throw new Error(`${submission.display_name || ('Submission ' + submission.submission_number)}: ${failedFiles.length} file(s) failed to upload.`);
       }
 
       uploadedSubmissionCount += 1;
@@ -1633,6 +1774,11 @@ function openDetail(id) {
   document.getElementById('dp-avatar').style.background = avatarColor(c.name);
   document.getElementById('dp-avatar').textContent = initials(c.name);
   document.getElementById('dp-name').textContent = c.name;
+  const suggestedNameEl = document.getElementById('dp-suggested-name');
+  if (suggestedNameEl) {
+    suggestedNameEl.textContent = '';
+    suggestedNameEl.style.display = 'none';
+  }
   document.getElementById('dp-role').textContent = c.role;
   document.getElementById('dp-skills').textContent = sanitizeSkills(c.skills) || 'No description provided.';
 
