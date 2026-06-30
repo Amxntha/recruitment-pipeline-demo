@@ -9,6 +9,9 @@
 # IMPORTS
 # ───────────────────────────────────────────────────────────────────────────────
 
+import smtplib
+from email.message import EmailMessage
+from typing import Optional, Literal
 import ast
 import base64
 import json
@@ -54,6 +57,11 @@ DEFAULT_BASE_FOLDER = os.getenv("DEFAULT_BASE_FOLDER", "HR Demo Candidate Log").
 # returns HTML instead of real file bytes. The API key stays server-side.
 JOTFORM_API_KEY = os.getenv("JOTFORM_API_KEY", "").strip()
 JOTFORM_API_BASE = os.getenv("JOTFORM_API_BASE", "https://api.jotform.com").rstrip("/")
+
+# SMTP 
+DOCUMENT_REQUEST_FORM_URL = os.getenv("DOCUMENT_REQUEST_FORM_URL").strip()
+SMTP_HOST = os.getenv("SMTP_HOST").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT"))
 
 app = FastAPI(title="HelpAtHandSupport API")
 
@@ -161,6 +169,7 @@ class FileDownloadError(ValueError):
 
 
 INTEGRATION_ID = "default"
+NAME_HISTORY_FILENAME = "name_history.txt"
 
 # ───────────────────────────────────────────────────────────────────────────────
 # DATABASE HELPERS
@@ -390,6 +399,12 @@ class SharePointDestinationIn(BaseModel):
     drive_url: Optional[str] = ""
     base_folder: Optional[str] = ""
 
+class SmtpDocumentRequestIn(BaseModel):
+    access_token: str
+    sender_email: str
+    request_type: Literal["initial", "rerequest"] = "initial"
+    missing_details: Optional[str] = None
+
 # ───────────────────────────────────────────────────────────────────────────────
 # PURE SPA / MICROSOFT GRAPH CONFIGURATION
 # ───────────────────────────────────────────────────────────────────────────────
@@ -578,6 +593,117 @@ def connect_microsoft_deprecated():
         "Pure SPA mode uses the frontend Connect button with MSAL.js; the backend does not perform Microsoft sign-in.",
     )
 
+
+# ───────────────────────────────────────────────────────────────────────────────
+# EMAIL HELPERS
+# ───────────────────────────────────────────────────────────────────────────────
+
+def build_document_request_email(
+    candidate: dict,
+    request_type: str = "initial",
+    missing_details: Optional[str] = None,
+) -> tuple[str, str]:
+    """Create the subject and body for initial or re-request document emails."""
+    name = candidate.get("name") or "there"
+
+    if not DOCUMENT_REQUEST_FORM_URL:
+        raise HTTPException(500, "DOCUMENT_REQUEST_FORM_URL is not configured.")
+
+    if request_type == "rerequest":
+        details = (missing_details or "").strip()
+        if not details:
+            details = "Some documents are missing or need to be updated."
+
+        subject = "Action required: missing or updated documents for your application"
+
+        body = f"""Hi {name},
+
+Thank you for submitting your documents.
+
+After reviewing your application, we need you to provide or update the following item(s):
+
+{details}
+
+Please complete the document request form again using the link below:
+
+{DOCUMENT_REQUEST_FORM_URL}
+
+Once we receive the updated information, we will continue processing your application.
+
+Kind regards,
+Help At Hand Support
+"""
+        return subject, body
+
+    subject = "Document request for your application"
+
+    body = f"""Hi {name},
+
+Thank you for your interest in working with Help At Hand Support.
+
+To continue with your application, please complete the document request form using the link below:
+
+{DOCUMENT_REQUEST_FORM_URL}
+
+Please upload the required documents through the form so we can continue processing your application.
+
+Kind regards,
+Help At Hand Support
+"""
+    return subject, body
+
+
+def send_smtp_oauth_email(
+    *,
+    sender_email: str,
+    recipient_email: str,
+    subject: str,
+    body: str,
+    access_token: str,
+) -> None:
+    """Send email through Microsoft 365 SMTP AUTH using OAuth/XOAUTH2."""
+    if not sender_email:
+        raise HTTPException(400, "Sender email is required.")
+
+    if not recipient_email:
+        raise HTTPException(400, "Recipient email is required.")
+
+    if not access_token:
+        raise HTTPException(400, "SMTP OAuth access token is required.")
+
+    message = EmailMessage()
+    message["From"] = sender_email
+    message["To"] = recipient_email
+    message["Subject"] = subject
+    message.set_content(body)
+
+    # Microsoft SMTP OAuth format:
+    # base64("user=" + userName + "^Aauth=Bearer " + accessToken + "^A^A")
+    auth_string = f"user={sender_email}\x01auth=Bearer {access_token}\x01\x01"
+    auth_b64 = base64.b64encode(auth_string.encode("utf-8")).decode("utf-8")
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+
+            code, response = server.docmd("AUTH", "XOAUTH2 " + auth_b64)
+
+            if code != 235:
+                raise HTTPException(
+                    500,
+                    f"SMTP OAuth authentication failed: {code} {response.decode(errors='ignore') if isinstance(response, bytes) else response}",
+                )
+
+            server.send_message(message)
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to send SMTP OAuth email: {exc}")
+
+
 # ───────────────────────────────────────────────────────────────────────────────
 # CANDIDATE HELPERS
 # ───────────────────────────────────────────────────────────────────────────────
@@ -667,6 +793,37 @@ def find_existing_candidate(
         "SELECT id FROM candidates WHERE lower(trim(email)) = ?",
         (email,),
     ).fetchone()
+
+
+def require_unique_manual_candidate_email(
+    conn: sqlite3.Connection,
+    email: Optional[str],
+    *,
+    exclude_candidate_id: Optional[str] = None,
+) -> str:
+    """Require a manual candidate email and prevent duplicate manual records."""
+    email = normalise_email(email)
+
+    if not email:
+        raise HTTPException(400, "Email is required")
+
+    if exclude_candidate_id:
+        existing = conn.execute(
+            """
+            SELECT id
+            FROM candidates
+            WHERE lower(trim(email)) = ?
+              AND id != ?
+            """,
+            (email, exclude_candidate_id),
+        ).fetchone()
+    else:
+        existing = find_existing_candidate(conn, email)
+
+    if existing:
+        raise HTTPException(409, "Candidate exists")
+
+    return email
 
 def next_candidate_version(conn: sqlite3.Connection, candidate_id: str) -> int:
     row = conn.execute(
@@ -1337,19 +1494,38 @@ def build_submission_summary(full_name: str, fields: dict, document_urls: dict) 
     return "\n".join(summary_lines) + "\n"
 
 
-def candidate_folder_name(cid: str, email: Optional[str] = None) -> str:
-    """Return the folder name used for local storage and SharePoint."""
-    cleaned_email = normalise_email(email)
+def candidate_folder_name(
+    cid: str,
+    email: Optional[str] = None,
+    full_name: Optional[str] = None,
+) -> str:
+    """Return the folder name used for local storage and SharePoint.
 
-    if cleaned_email:
-        return sanitize_email_folder_name(cleaned_email)
+    Preferred format is {full_name}_{email}. The email is kept readable
+    because it is the stable identifier used to match JotForm submissions.
+    """
+    cleaned_name = sanitize_filename(full_name or "")
+    cleaned_email = sanitize_email_folder_name(email or "")
+
+    if cleaned_name and cleaned_email and cleaned_email != "candidate":
+        return f"{cleaned_name}_{cleaned_email}"
+
+    if cleaned_email and cleaned_email != "candidate":
+        return cleaned_email
+
+    if cleaned_name:
+        return cleaned_name
 
     return sanitize_filename(cid)
 
 
-def candidate_local_folder(cid: str, email: Optional[str] = None) -> str:
+def candidate_local_folder(
+    cid: str,
+    email: Optional[str] = None,
+    full_name: Optional[str] = None,
+) -> str:
     """Return the local storage folder for a candidate."""
-    return os.path.join(STORAGE_ROOT, candidate_folder_name(cid, email))
+    return os.path.join(STORAGE_ROOT, candidate_folder_name(cid, email, full_name))
 
 
 def submission_folder_name(submission_number: int, submission_id: Optional[str] = None) -> str:
@@ -1601,6 +1777,245 @@ def submission_uploaded_date(submission: Optional[dict]) -> str:
     )
 
 
+def ensure_candidate_folder_path(
+    conn: sqlite3.Connection,
+    cid: str,
+    candidate: dict,
+    *,
+    preferred_name: Optional[str] = None,
+    preferred_email: Optional[str] = None,
+    create_folder: bool = False,
+) -> str:
+    """Return the stable initial candidate folder path and store it if missing.
+
+    Once local_folder_path is set, it is treated as the permanent folder name.
+    Later HR name changes do not rename local storage or SharePoint folders.
+    """
+    local_folder = (candidate.get("local_folder_path") or "").strip()
+
+    if not local_folder:
+        local_folder = candidate_local_folder(
+            cid,
+            preferred_email or candidate.get("email"),
+            preferred_name or candidate.get("name"),
+        )
+        conn.execute(
+            "UPDATE candidates SET local_folder_path = ? WHERE id = ?",
+            (local_folder, cid),
+        )
+        candidate["local_folder_path"] = local_folder
+
+    if create_folder:
+        os.makedirs(local_folder, exist_ok=True)
+
+    return local_folder
+
+
+def name_change_history_payload(conn: sqlite3.Connection, cid: str, current_name: str) -> dict:
+    """Return manual name-change history and candidate-submitted suggested names."""
+    current_name_norm = normalise_name_for_compare(current_name)
+
+    version_rows = conn.execute(
+        """
+        SELECT *
+        FROM candidate_versions
+        WHERE candidate_id = ?
+        ORDER BY version_number ASC
+        """,
+        (cid,),
+    ).fetchall()
+
+    previous_names: list[dict] = []
+    official_name_norms = {current_name_norm} if current_name_norm else set()
+
+    for row in version_rows:
+        item = row_to_dict(row)
+        if item.get("source") != "website":
+            continue
+
+        try:
+            diff = json.loads(item.get("diff_json") or "{}")
+            before_json = json.loads(item.get("before_json") or "{}")
+            after_json = json.loads(item.get("after_json") or "{}")
+        except (TypeError, ValueError):
+            continue
+
+        if "name" not in diff:
+            continue
+
+        previous_name = (before_json.get("name") or diff.get("name", {}).get("before") or "").strip()
+        new_name = (after_json.get("name") or diff.get("name", {}).get("after") or "").strip()
+
+        previous_name_norm = normalise_name_for_compare(previous_name)
+        new_name_norm = normalise_name_for_compare(new_name)
+
+        if previous_name_norm:
+            official_name_norms.add(previous_name_norm)
+        if new_name_norm:
+            official_name_norms.add(new_name_norm)
+
+        if not previous_name or not new_name:
+            continue
+        if previous_name_norm == new_name_norm:
+            continue
+
+        previous_names.append({
+            "previous_name": previous_name,
+            "new_name": new_name,
+            "changed_date": item.get("created_at") or "",
+            "changed_by": item.get("changed_by") or "Website user",
+            "version_number": item.get("version_number"),
+        })
+
+    submission_rows = conn.execute(
+        """
+        SELECT submission_number, submission_date, submitted_name, created_at
+        FROM candidate_submissions
+        WHERE candidate_id = ?
+        ORDER BY submission_number ASC
+        """,
+        (cid,),
+    ).fetchall()
+
+    submitted_name_history: list[dict] = []
+    for row in submission_rows:
+        item = row_to_dict(row)
+        submitted_name = (item.get("submitted_name") or "").strip()
+        if not submitted_name:
+            continue
+
+        submitted_name_history.append({
+            "name": submitted_name,
+            "submitted_date": item.get("submission_date") or item.get("created_at") or "",
+            "submission_number": item.get("submission_number"),
+        })
+
+    suggested_names: list[dict] = []
+    seen_names = set()
+    for row in reversed(submission_rows):
+        item = row_to_dict(row)
+        submitted_name = (item.get("submitted_name") or "").strip()
+        submitted_name_norm = normalise_name_for_compare(submitted_name)
+
+        if not submitted_name:
+            continue
+
+        # A candidate-submitted name is only a pending suggestion if it is not
+        # already the candidate's current name and has not already been used as
+        # an official HR-managed name. This prevents the original name from
+        # reappearing as a suggestion after HR accepts a suggested new name.
+        if submitted_name_norm in official_name_norms:
+            continue
+        if submitted_name_norm in seen_names:
+            continue
+
+        seen_names.add(submitted_name_norm)
+        suggested_names.append({
+            "name": submitted_name,
+            "submitted_date": item.get("submission_date") or item.get("created_at") or "",
+            "submission_number": item.get("submission_number"),
+        })
+
+    return {
+        "previous_names": previous_names,
+        "latest_previous_name": previous_names[-1] if previous_names else None,
+        "submitted_name_history": submitted_name_history,
+        "suggested_names": suggested_names,
+        "latest_suggested_name": suggested_names[0] if suggested_names else None,
+    }
+
+
+def write_candidate_name_history_file(
+    conn: sqlite3.Connection,
+    cid: str,
+    *,
+    mark_sharepoint_pending: bool = False,
+) -> Optional[str]:
+    """Write name_history.txt into the stable candidate folder."""
+    row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
+    if not row:
+        return None
+
+    candidate = row_to_dict(row)
+    local_folder = ensure_candidate_folder_path(
+        conn,
+        cid,
+        candidate,
+        preferred_name=candidate.get("name"),
+        preferred_email=candidate.get("email"),
+        create_folder=True,
+    )
+
+    current_name = candidate.get("name") or ""
+    payload = name_change_history_payload(conn, cid, current_name)
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    lines = [
+        "Candidate Name History",
+        "======================",
+        f"Candidate ID: {cid}",
+        f"Current name: {current_name or 'Unknown'}",
+        f"Email: {candidate.get('email') or ''}",
+        f"Stable folder name: {os.path.basename(local_folder.rstrip('/\\\\'))}",
+        f"Generated at: {generated_at}",
+        "",
+        "Manual HR name changes:",
+    ]
+
+    if payload["previous_names"]:
+        for item in payload["previous_names"]:
+            lines.append(
+                f"- {item.get('changed_date') or 'Unknown date'}: "
+                f"previous name '{item.get('previous_name')}' -> new name '{item.get('new_name')}'"
+            )
+    else:
+        lines.append("- None recorded")
+
+    lines.extend(["", "Candidate-submitted names:"])
+    if payload.get("submitted_name_history"):
+        for item in payload["submitted_name_history"]:
+            date = item.get("submitted_date") or "Unknown date"
+            sub_no = item.get("submission_number")
+            suffix = f" (submission {sub_no})" if sub_no else ""
+            name_label = "pending suggested name" if item.get("name") in {s.get("name") for s in payload.get("suggested_names", [])} else "submitted name"
+            lines.append(f"- {date}: {name_label} '{item.get('name')}'{suffix}")
+    else:
+        lines.append("- None recorded")
+
+    history_path = os.path.join(local_folder, NAME_HISTORY_FILENAME)
+    with open(history_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+    if mark_sharepoint_pending:
+        conn.execute(
+            """
+            UPDATE candidates
+            SET sharepoint_sync_status = CASE
+                WHEN sharepoint_folder_url IS NOT NULL AND sharepoint_folder_url != ''
+                    THEN 'Pending browser sync - name history updated'
+                ELSE sharepoint_sync_status
+            END
+            WHERE id = ?
+            """,
+            (cid,),
+        )
+        conn.execute(
+            """
+            UPDATE candidate_submissions
+            SET sharepoint_sync_status = CASE
+                    WHEN sharepoint_folder_url IS NOT NULL AND sharepoint_folder_url != ''
+                        THEN 'Pending browser sync - name history updated'
+                    ELSE sharepoint_sync_status
+                END,
+                updated_at = datetime('now')
+            WHERE candidate_id = ?
+            """,
+            (cid,),
+        )
+
+    return history_path
+
+
 def local_file_info_from_manifest(
     *,
     cid: str,
@@ -1670,12 +2085,28 @@ def save_candidate_submission(
     candidate: CandidateIn,
     document_urls: dict,
     jotform_context: Optional[dict] = None,
+    folder_candidate_name: Optional[str] = None,
+    folder_candidate_email: Optional[str] = None,
 ) -> None:
-    """Save each JotForm submission inside one email-based candidate folder."""
+    """Save each JotForm submission inside one candidate folder.
+
+    The physical folder uses the saved candidate profile name and email in
+    {full_name}_{email} format. The submitted_name stored in the database still
+    comes from the JotForm payload so alternate names can be surfaced in the UI.
+    """
     with get_conn() as conn:
         submission_number = next_submission_number(conn, cid)
+        candidate_row = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
+        candidate_profile = row_to_dict(candidate_row) if candidate_row else {}
+        candidate_folder = ensure_candidate_folder_path(
+            conn,
+            cid,
+            candidate_profile,
+            preferred_name=folder_candidate_name or candidate.name,
+            preferred_email=folder_candidate_email or candidate.email,
+            create_folder=False,
+        )
 
-    candidate_folder = candidate_local_folder(cid, candidate.email)
     local_folder = candidate_folder
 
     summary_text = build_submission_summary(
@@ -1748,6 +2179,10 @@ def save_candidate_submission(
             (candidate_folder, sync_status, cid),
         )
 
+        # Keep a readable audit file inside the stable candidate folder.
+        # This includes HR name changes and candidate-submitted alternate names.
+        write_candidate_name_history_file(conn, cid)
+
     print("[STORAGE DEBUG] Submission version saved locally", storage_result)
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -1802,6 +2237,17 @@ def handle_document_request(raw: dict, jotform_context: Optional[dict] = None):
                 preserve_existing_values=True,
             )
 
+            # A submitted JotForm document request means the candidate's documents were received.
+            # This must override the existing pipeline stage, even though other fields are preserved.
+            conn.execute(
+                """
+                UPDATE candidates
+                SET stage = ?
+                WHERE id = ?
+                """,
+                ("Documents Received", cid),
+            )
+
             action = "jotform_update"
 
         else:
@@ -1828,7 +2274,19 @@ def handle_document_request(raw: dict, jotform_context: Optional[dict] = None):
             jotform_context=jotform_context,
         )
 
-    save_candidate_submission(cid, candidate, document_urls, jotform_context)
+    with get_conn() as conn:
+        refreshed = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
+
+    refreshed_candidate = row_to_dict(refreshed)
+
+    save_candidate_submission(
+        cid,
+        candidate,
+        document_urls,
+        jotform_context,
+        folder_candidate_name=refreshed_candidate.get("name") or candidate.name,
+        folder_candidate_email=refreshed_candidate.get("email") or candidate.email,
+    )
 
     with get_conn() as conn:
         refreshed = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
@@ -1868,9 +2326,27 @@ def list_candidates(
 
 @app.post("/api/candidates", response_model=CandidateOut, status_code=201)
 def create_candidate(data: CandidateIn):
-    """Create a new candidate record and record the website creation as version 1."""
+    """Create a manual candidate only when a unique email is provided."""
     with get_conn() as conn:
+        email = require_unique_manual_candidate_email(conn, data.email)
+        data = data.model_copy(update={"email": email})
+
         created = insert_candidate_record(conn, data)
+
+        # Store the initial folder path immediately so later HR name changes do
+        # not rename the local or SharePoint candidate folder. The physical
+        # folder is created only when files/name history need to be written.
+        ensure_candidate_folder_path(
+            conn,
+            created["id"],
+            created,
+            preferred_name=created.get("name"),
+            preferred_email=created.get("email"),
+            create_folder=False,
+        )
+        created_row = conn.execute("SELECT * FROM candidates WHERE id = ?", (created["id"],)).fetchone()
+        created = row_to_dict(created_row)
+
         record_candidate_version(
             conn,
             candidate_id=created["id"],
@@ -1896,8 +2372,8 @@ def list_candidate_local_files(cid: str, submission_number: Optional[int] = None
         raise HTTPException(404, "Candidate not found")
 
     candidate = row_to_dict(candidate_row)
-    candidate_folder = candidate.get("local_folder_path") or candidate_local_folder(cid, candidate.get("email"))
-    candidate_folder_basename = os.path.basename(candidate_folder.rstrip("/\\")) or candidate_folder_name(cid, candidate.get("email"))
+    candidate_folder = candidate.get("local_folder_path") or candidate_local_folder(cid, candidate.get("email"), candidate.get("name"))
+    candidate_folder_basename = os.path.basename(candidate_folder.rstrip("/\\")) or candidate_folder_name(cid, candidate.get("email"), candidate.get("name"))
 
     if submission_row:
         submission = row_to_dict(submission_row)
@@ -1959,6 +2435,24 @@ def list_candidate_local_files(cid: str, submission_number: Optional[int] = None
             "preview_url": f"/api/candidates/{cid}/files/{quote(filename, safe='')}" + (f"?submission_number={selected_submission_number}" if selected_submission_number else ""),
         })
 
+    name_history_path = os.path.join(local_folder, NAME_HISTORY_FILENAME)
+    if os.path.isfile(name_history_path) and not any(f.get("filename") == NAME_HISTORY_FILENAME for f in files):
+        history_url = f"/api/candidates/{cid}/files/{quote(NAME_HISTORY_FILENAME, safe='')}" + (f"?submission_number={selected_submission_number}" if selected_submission_number else "")
+        files.append({
+            "filename": NAME_HISTORY_FILENAME,
+            "label": "Name history",
+            "document_key": "name_history",
+            "content_type": "text/plain",
+            "detected_type": "Text file",
+            "previewable": True,
+            "size_bytes": os.path.getsize(name_history_path),
+            "uploaded_date": datetime.fromtimestamp(os.path.getmtime(name_history_path)).strftime("%Y-%m-%d"),
+            "submission_number": selected_submission_number,
+            "submission_display_name": submission_display_name(selected_submission_number) if selected_submission_number else "Latest submission",
+            "download_url": history_url,
+            "preview_url": history_url,
+        })
+
     return {
         "candidate_id": cid,
         "candidate_name": candidate.get("name") or "",
@@ -1993,7 +2487,7 @@ def download_candidate_local_file(cid: str, filename: str, submission_number: Op
     if not candidate_row:
         raise HTTPException(404, "Candidate not found")
 
-    candidate_folder = candidate_row["local_folder_path"] or candidate_local_folder(cid, candidate_row["email"])
+    candidate_folder = candidate_row["local_folder_path"] or candidate_local_folder(cid, candidate_row["email"], candidate_row["name"])
     if submission_row:
         local_folder = submission_row["local_folder_path"] or candidate_folder
     else:
@@ -2086,7 +2580,29 @@ def update_candidate(cid: str, data: CandidateIn):
         if not before_row:
             raise HTTPException(404, "Candidate not found")
 
-        before = candidate_snapshot(row_to_dict(before_row))
+        before_candidate = row_to_dict(before_row)
+        before_name = before_candidate.get("name") or ""
+
+        email = require_unique_manual_candidate_email(
+            conn,
+            data.email,
+            exclude_candidate_id=cid,
+        )
+        data = data.model_copy(update={"email": email})
+
+        # If this is the first time the candidate needs a folder path, lock it
+        # to the name that existed before this HR edit. Later name changes must
+        # not rename the local or SharePoint folder.
+        ensure_candidate_folder_path(
+            conn,
+            cid,
+            before_candidate,
+            preferred_name=before_candidate.get("name"),
+            preferred_email=before_candidate.get("email"),
+            create_folder=False,
+        )
+
+        before = candidate_snapshot(before_candidate)
 
         result = update_candidate_record(
             conn,
@@ -2101,6 +2617,11 @@ def update_candidate(cid: str, data: CandidateIn):
         ).fetchone()
         after = candidate_snapshot(row_to_dict(after_row))
 
+        name_changed = (
+            normalise_name_for_compare(before_name)
+            != normalise_name_for_compare(after.get("name"))
+        )
+
         record_candidate_version(
             conn,
             candidate_id=cid,
@@ -2111,6 +2632,11 @@ def update_candidate(cid: str, data: CandidateIn):
             after=after,
             changed_by="Website user",
         )
+
+        if name_changed:
+            write_candidate_name_history_file(conn, cid, mark_sharepoint_pending=True)
+            refreshed = conn.execute("SELECT * FROM candidates WHERE id = ?", (cid,)).fetchone()
+            return row_to_dict(refreshed)
 
         return result
 
@@ -2170,8 +2696,8 @@ def get_candidate_submissions(cid: str):
         ).fetchall()
 
     candidate = row_to_dict(candidate_row)
-    candidate_folder = candidate.get("local_folder_path") or candidate_local_folder(cid, candidate.get("email"))
-    candidate_folder_basename = os.path.basename(candidate_folder.rstrip("/\\")) or candidate_folder_name(cid, candidate.get("email"))
+    candidate_folder = candidate.get("local_folder_path") or candidate_local_folder(cid, candidate.get("email"), candidate.get("name"))
+    candidate_folder_basename = os.path.basename(candidate_folder.rstrip("/\\")) or candidate_folder_name(cid, candidate.get("email"), candidate.get("name"))
 
     submissions = []
     for row in rows:
@@ -2287,31 +2813,96 @@ def get_candidate_documents_view(cid: str):
             })
 
     current_name = candidate.get("name") or ""
-    current_name_norm = normalise_name_for_compare(current_name)
-    suggested_names = []
-    seen_names = set()
-    for submission in reversed(timeline_submissions):
-        submitted_name = (submission.get("submitted_name") or "").strip()
-        submitted_name_norm = normalise_name_for_compare(submitted_name)
-        if not submitted_name or submitted_name_norm == current_name_norm or submitted_name_norm in seen_names:
-            continue
-        seen_names.add(submitted_name_norm)
-        suggested_names.append({
-            "name": submitted_name,
-            "submitted_date": submission.get("submission_date") or submission.get("uploaded_date") or "",
-            "submission_number": submission.get("submission_number"),
-        })
+    with get_conn() as conn:
+        name_history = name_change_history_payload(conn, cid, current_name)
 
     return {
         "candidate_id": cid,
         "candidate_name": current_name,
         "sharepoint_folder_url": candidate.get("sharepoint_folder_url") or "",
-        "suggested_names": suggested_names,
-        "latest_suggested_name": suggested_names[0] if suggested_names else None,
+        "suggested_names": name_history["suggested_names"],
+        "latest_suggested_name": name_history["latest_suggested_name"],
+        "previous_names": name_history["previous_names"],
+        "previously_known_as": name_history["latest_previous_name"],
+        "submitted_name_history": name_history.get("submitted_name_history", []),
         "latest_documents": latest_documents,
         "timeline": timeline_submissions,
     }
 
+@app.post("/api/candidates/{cid}/send-document-request-smtp", response_model=CandidateOut)
+def send_document_request_smtp(cid: str, data: SmtpDocumentRequestIn):
+    """Send a document request email using SMTP OAuth and update candidate stage."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM candidates WHERE id = ?",
+            (cid,),
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(404, "Candidate not found")
+
+        candidate = row_to_dict(row)
+        recipient_email = normalise_email(candidate.get("email"))
+
+        if not recipient_email:
+            raise HTTPException(400, "Candidate does not have an email address.")
+
+        before = candidate_snapshot(candidate)
+
+        subject, body = build_document_request_email(
+            candidate,
+            request_type=data.request_type,
+            missing_details=data.missing_details,
+        )
+
+        send_smtp_oauth_email(
+            sender_email=data.sender_email,
+            recipient_email=recipient_email,
+            subject=subject,
+            body=body,
+            access_token=data.access_token,
+        )
+
+        conn.execute(
+            """
+            UPDATE candidates
+            SET stage = ?
+            WHERE id = ?
+            """,
+            ("Documents Requested", cid),
+        )
+
+        updated_row = conn.execute(
+            "SELECT * FROM candidates WHERE id = ?",
+            (cid,),
+        ).fetchone()
+
+        updated = row_to_dict(updated_row)
+
+        action = (
+            "document_request_email_rerequested_smtp_oauth"
+            if data.request_type == "rerequest"
+            else "document_request_email_sent_smtp_oauth"
+        )
+        
+        record_candidate_version(
+        conn,
+        candidate_id=cid,
+        source="email",
+        action=action,
+        before=before,
+        incoming={
+            "email": recipient_email,
+            "stage": "Documents Requested",
+            "sender_email": data.sender_email,
+            "request_type": data.request_type,
+            "missing_details": data.missing_details,
+        },
+        after=candidate_snapshot(updated),
+        changed_by=data.sender_email,
+)
+
+    return updated
 
 # ───────────────────────────────────────────────────────────────────────────────
 # API ROUTES - STATISTICS / HEALTH
@@ -2349,7 +2940,7 @@ def debug_local_file_types(cid: str):
     if not row:
         raise HTTPException(404, "Candidate not found")
 
-    local_folder = row["local_folder_path"] or candidate_local_folder(cid, row["email"])
+    local_folder = row["local_folder_path"] or candidate_local_folder(cid, row["email"], row["name"])
     if not os.path.isdir(local_folder):
         raise HTTPException(404, "Local candidate folder not found")
 

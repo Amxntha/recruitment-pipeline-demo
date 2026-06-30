@@ -142,7 +142,7 @@
   .step-label.done { color: var(--ink-muted); }
   .step-label.current { font-weight: 500; color: var(--accent); }
   .step-label.upcoming { color: var(--ink-light); }
-  .detail-actions { padding: 16px 24px; border-top: 1px solid var(--border); display: flex; gap: 10px; }
+  .detail-actions { padding: 16px 24px; border-top: 1px solid var(--border); display: flex; gap: 10px; flex-wrap: wrap; }
 
   .toast { position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%) translateY(20px); background: var(--ink); color: var(--cream); padding: 10px 20px; border-radius: 8px; font-size: 13.5px; z-index: 500; opacity: 0; transition: all 0.25s; pointer-events: none; white-space: nowrap; }
   .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
@@ -213,6 +213,7 @@
   .doc-chip:hover { background: var(--accent-light); }
   .sharepoint-folder-link { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
   .suggested-name { margin-top: 4px; font-size: 12px; color: var(--accent); }
+  .suggested-name .doc-preview-btn { margin-top: 4px; padding: 4px 8px; font-size: 11.5px; }
 
   /* Loading spinner */
   .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); border-top-color: white; border-radius: 50%; animation: spin 0.7s linear infinite; }
@@ -404,6 +405,7 @@
     </div>
     <div class="modal-body">
       <div class="field"><label>Candidate name *</label><input type="text" id="f-name" placeholder="e.g. Sarah Mitchell"></div>
+      <div class="field"><label>Candidate email *</label><input type="email" id="f-email" placeholder="e.g. candidate@example.com" required></div>
       <div class="field-row">
         <div class="field"><label>Role *</label>
           <select id="f-role"><option value="Support Worker">Support Worker</option><option value="Client">Client</option></select>
@@ -457,6 +459,9 @@
     <div class="detail-section"><div class="detail-section-title">Pipeline progress</div><div class="pipeline-steps" id="dp-pipeline"></div></div>
   </div>
   <div class="detail-actions">
+    <button class="btn btn-primary" id="send-doc-request-btn" style="flex-basis:100%;justify-content:center;" onclick="sendDocumentRequestEmailSmtp(currentDetailId)">
+      Send document request
+    </button>
     <button class="btn btn-ghost" style="flex:1" onclick="editFromDetail()">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
       Edit
@@ -473,6 +478,7 @@
 <script src="https://alcdn.msauth.net/browser/2.38.0/js/msal-browser.min.js"></script>
 <script>
 const API = '/api';
+const SMTP_SEND_SCOPE = 'https://outlook.office.com/SMTP.Send';
 const STAGES = ['Shortlisted','Screening Call','Documents Requested','Documents Received','Interviewed','Hired'];
 const COLORS = ['#C8502A','#7B5EA7','#2A7B9B','#B8862A','#2A7B6F','#6B4A9E','#2A7B4F','#B83232','#4A7BA7','#7B4A2A'];
 
@@ -736,16 +742,56 @@ function sharePointFolderLinkHtml(candidate, documentsData) {
   return `<div class="sharepoint-folder-link"><strong>SharePoint candidate folder:</strong> <a href="${esc(url)}" target="_blank" rel="noreferrer">Open candidate folder</a></div>`;
 }
 
+function toggleSuggestedCandidateName() {
+  const details = document.getElementById('dp-suggested-name-details');
+  if (!details) return;
+
+  const isHidden = details.style.display === 'none' || !details.style.display;
+  details.style.display = isHidden ? 'block' : 'none';
+}
+
+function normaliseNameForCompare(name) {
+  return String(name || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
 function renderSuggestedCandidateName(documentsData) {
   const el = document.getElementById('dp-suggested-name');
   if (!el) return;
-  const suggestion = documentsData && documentsData.latest_suggested_name;
+
+  const candidateName = documentsData && documentsData.candidate_name;
+  const rawSuggestion = documentsData && documentsData.latest_suggested_name;
+  const suggestion = rawSuggestion && normaliseNameForCompare(rawSuggestion.name) !== normaliseNameForCompare(candidateName)
+    ? rawSuggestion
+    : null;
+  const previous = documentsData && documentsData.previously_known_as;
+  const parts = [];
+
+  if (previous && previous.previous_name) {
+    parts.push(`
+      <div class="local-doc-meta" style="margin-top:4px;">
+        Previously known as: ${esc(previous.previous_name)}
+      </div>
+    `);
+  }
+
   if (suggestion && suggestion.name) {
     const date = suggestion.submitted_date ? formatUploadDate(suggestion.submitted_date) : 'unknown date';
-    el.textContent = `Suggested name: ${suggestion.name} from ${date}`;
+
+    parts.push(`
+      <button class="doc-preview-btn" type="button" onclick="toggleSuggestedCandidateName()">
+        Suggested name available
+      </button>
+      <div id="dp-suggested-name-details" class="local-doc-meta" style="display:none; margin-top:6px;">
+        ${esc(suggestion.name)} from ${esc(date)}
+      </div>
+    `);
+  }
+
+  if (parts.length) {
+    el.innerHTML = parts.join('');
     el.style.display = 'block';
   } else {
-    el.textContent = '';
+    el.innerHTML = '';
     el.style.display = 'none';
   }
 }
@@ -1058,6 +1104,155 @@ async function getGraphToken(options = {}) {
       account
     });
     return tokenResponse.accessToken;
+  }
+}
+
+
+async function getSmtpSendToken() {
+  await loadMicrosoftConfig();
+
+  let account = getSignedInMicrosoftAccount();
+
+  if (!account) {
+    const loginResult = await msalInstance.loginPopup({
+      scopes: [SMTP_SEND_SCOPE]
+    });
+
+    account = loginResult.account;
+    msalInstance.setActiveAccount(account);
+    currentMicrosoftAccount = account;
+  }
+
+  try {
+    const result = await msalInstance.acquireTokenSilent({
+      scopes: [SMTP_SEND_SCOPE],
+      account
+    });
+
+    return {
+      accessToken: result.accessToken,
+      senderEmail: result.account?.username || account.username
+    };
+  } catch (e) {
+    const result = await msalInstance.acquireTokenPopup({
+      scopes: [SMTP_SEND_SCOPE],
+      account
+    });
+
+    return {
+      accessToken: result.accessToken,
+      senderEmail: result.account?.username || account.username
+    };
+  }
+}
+
+async function hasPreviousDocumentRequestEmail(candidateId) {
+  try {
+    const data = await apiFetch(`/candidates/${candidateId}/versions`);
+    return (data.versions || []).some(v => {
+      const action = String(v.action || '').toLowerCase();
+      return action.includes('document_request_email_sent') ||
+             action.includes('document_request_email_rerequested') ||
+             action.includes('document_request_email_sent_smtp') ||
+             action.includes('document_request_email_rerequested_smtp');
+    });
+  } catch (e) {
+    return false;
+  }
+}
+
+function stageSuggestsDocumentRequestAlreadySent(candidate) {
+  const stage = String(candidate?.stage || '');
+  return stage === 'Documents Requested' || stage === 'Documents Received';
+}
+
+function setDocumentEmailButtonsDisabled(disabled, label = null) {
+  const sendBtn = document.getElementById('send-doc-request-btn');
+
+  if (sendBtn) {
+    if (!sendBtn.dataset.originalLabel) sendBtn.dataset.originalLabel = sendBtn.innerHTML;
+    sendBtn.disabled = disabled;
+    sendBtn.innerHTML = disabled && label ? label : sendBtn.dataset.originalLabel;
+  }
+}
+
+async function resolveDocumentRequestType(id, candidate, options = {}) {
+  const explicitType = options.requestType || options.request_type;
+  if (explicitType === 'initial' || explicitType === 'rerequest') {
+    return explicitType;
+  }
+
+  const previousEmailSent = await hasPreviousDocumentRequestEmail(id);
+  if (previousEmailSent || stageSuggestsDocumentRequestAlreadySent(candidate)) {
+    return 'rerequest';
+  }
+
+  return 'initial';
+}
+
+async function sendDocumentRequestEmailSmtp(id, options = {}) {
+  if (!id) return;
+
+  const candidate = options.candidateOverride || candidates.find(c => c.id === id);
+
+  if (!candidate) {
+    toast('Candidate not found', true);
+    return;
+  }
+
+  if (!candidate.email) {
+    toast('Candidate does not have an email address', true);
+    return;
+  }
+
+  const requestType = await resolveDocumentRequestType(id, candidate, options);
+  let missingDetails = String(options.missingDetails || options.missing_details || '').trim();
+
+  if (requestType === 'rerequest' && !missingDetails) {
+    const response = prompt(
+      'Enter the missing or updated documents to request from the candidate:',
+      ''
+    );
+
+    if (response === null) return;
+    missingDetails = response.trim();
+
+    if (!missingDetails && !confirm('No specific missing documents were entered. Send a general re-request email?')) {
+      return;
+    }
+  }
+
+  const confirmMessage = requestType === 'rerequest'
+    ? `Send a re-request email to ${candidate.email}?`
+    : `Send the initial document request email to ${candidate.email}?`;
+
+  if (!options.skipConfirm && !confirm(confirmMessage)) return;
+
+  try {
+    setDocumentEmailButtonsDisabled(true, '<span class="spinner"></span> Sending…');
+
+    const token = await getSmtpSendToken();
+
+    await apiFetch(`/candidates/${id}/send-document-request-smtp`, {
+      method: 'POST',
+      body: JSON.stringify({
+        access_token: token.accessToken,
+        sender_email: token.senderEmail,
+        request_type: requestType,
+        missing_details: missingDetails
+      })
+    });
+
+    toast(requestType === 'rerequest' ? 'Document re-request email sent' : 'Document request email sent');
+    await refresh();
+
+    if (currentDetailId === id) {
+      openDetail(id);
+    }
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    setDocumentEmailButtonsDisabled(false);
   }
 }
 
@@ -1684,6 +1879,7 @@ function openAddModal() {
   editingId = null;
   document.getElementById('modal-title').textContent = 'Add candidate';
   document.getElementById('f-name').value = '';
+  document.getElementById('f-email').value = '';
   document.getElementById('f-role').value = 'Support Worker';
   document.getElementById('f-skills').value = '';
   document.getElementById('f-stage').value = 'Shortlisted';
@@ -1705,6 +1901,7 @@ function openEditModal(id) {
   editingId = id;
   document.getElementById('modal-title').textContent = 'Edit candidate';
   document.getElementById('f-name').value = c.name;
+  document.getElementById('f-email').value = c.email || '';
   document.getElementById('f-role').value = c.role;
   document.getElementById('f-skills').value = c.skills || '';
   document.getElementById('f-stage').value = c.stage;
@@ -1722,9 +1919,14 @@ function maybeCloseModal(e) { if (e.target === document.getElementById('modal-ov
 
 async function saveCandidate() {
   const name = document.getElementById('f-name').value.trim();
+  const email = document.getElementById('f-email').value.trim().toLowerCase();
+
   if (!name) { toast('Please enter a candidate name', true); return; }
+  if (!email) { toast('Please enter a candidate email', true); return; }
+
   const data = {
     name,
+    email,
     role: document.getElementById('f-role').value,
     skills: document.getElementById('f-skills').value.trim(),
     stage: document.getElementById('f-stage').value,
@@ -1747,10 +1949,25 @@ async function saveCandidate() {
       await apiFetch('/candidates/' + editingId, { method: 'PUT', body: JSON.stringify(data) });
       toast('Candidate updated');
     } else {
-      await apiFetch('/candidates', { method: 'POST', body: JSON.stringify(data) });
+      const created = await apiFetch('/candidates', { method: 'POST', body: JSON.stringify(data) });
       toast('Candidate added');
+
+      if (created?.email && confirm('Send a document request email to this candidate now?')) {
+        await sendDocumentRequestEmailSmtp(created.id, {
+          skipConfirm: true,
+          candidateOverride: created,
+          requestType: 'initial'
+        });
+      }
     }
-    closeModal(); refresh();
+
+    const detailIdToRefresh = currentDetailId;
+    closeModal();
+    await refresh();
+
+    if (detailIdToRefresh && candidates.some(c => c.id === detailIdToRefresh)) {
+      openDetail(detailIdToRefresh);
+    }
   } catch(e) { toast(e.message, true); }
   finally { btn.disabled = false; btn.innerHTML = 'Save candidate'; }
 }
